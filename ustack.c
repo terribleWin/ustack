@@ -63,9 +63,14 @@ static int ustack_init_port(struct rte_mempool *mbuf_pool) {
 
     struct rte_eth_txconf txq_conf = dev_info.default_txconf;
     txq_conf.offloads = port_conf_default.rxmode.offloads;
-    
-    // 初始化 TX 队列：128 个描述符，NULL 表示使用驱动默认配置
-    if (rte_eth_tx_queue_setup(global_portid, 0, 128, rte_eth_dev_socket_id(global_portid), &txq_conf) < 0) {
+
+    // 不同 PMD 对描述符数量有最小/对齐要求（e1000 的 TX 最少 512），
+    // 用 rte_eth_dev_adjust_nb_rx_tx_desc() 按 dev_info.tx_desc_lim 自动校正
+    uint16_t nb_tx_desc = 512;
+    rte_eth_dev_adjust_nb_rx_tx_desc(global_portid, NULL, &nb_tx_desc);
+
+    // 初始化 TX 队列：NULL 表示使用驱动默认配置
+    if (rte_eth_tx_queue_setup(global_portid, 0, nb_tx_desc, rte_eth_dev_socket_id(global_portid), &txq_conf) < 0) {
         rte_exit(EXIT_FAILURE, "Could not set up TX queues\n");
     }
 
