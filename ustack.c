@@ -11,7 +11,11 @@ int global_portid = 0;   /* 使用的端口号（对应第一个可用的 ethdev
 
 #define NUM_MBUFS 4096   /* mbuf 内存池容量，决定可同时在途的收包缓冲区数量 */
 #define BURST_SIZE 128   /* 单次收包批量上限（rte_eth_rx_burst 一次最多收取的报文数） */
+
 #define ENABLE_SEND 1
+#define ENABLE_TCP 1
+
+#define TCP_INIT_WINDOWS 14600
 
 #if ENABLE_SEND
 
@@ -26,11 +30,39 @@ uint16_t global_dport;
 
 #endif
 
+#if ENABLE_TCP
+
+// 根据 RFC 793 建立 TCP 三次握手状态机
+typedef enum __USTACK_TCP_STATUS {
+
+	USTACK_TCP_STATUS_CLOSED = 0,
+	USTACK_TCP_STATUS_LISTEN,
+	USTACK_TCP_STATUS_SYN_RCVD,
+	USTACK_TCP_STATUS_SYN_SENT,
+	USTACK_TCP_STATUS_ESTABLISHED,
+	USTACK_TCP_STATUS_FIN_WAIT_1,
+	USTACK_TCP_STATUS_FIN_WAIT_2,
+	USTACK_TCP_STATUS_CLOSING,
+	USTACK_TCP_STATUS_TIMEWAIT,
+	USTACK_TCP_STATUS_CLOSE_WAIT,
+	USTACK_TCP_STATUS_LAST_ACK
+	
+} USTACK_TCP_STATUS;
+
+uint8_t tcp_status = USTACK_TCP_STATUS_LISTEN;
+
+uint8_t global_flags;
+uint32_t global_seqnum;
+uint32_t global_acknum;
+
+#endif
+
 /* 端口默认配置：普通以太网帧，最大接收长度 1518 字节 */
 static const struct rte_eth_conf port_conf_default = {
     .rxmode = { .max_rx_pkt_len = RTE_ETHER_MAX_LEN }
 };
 
+/* 初始化 */
 static int ustack_init_port(struct rte_mempool *mbuf_pool) {
     // 统计当前可用的以太网端口数（仅打印信息，本程序只使用 global_portid）
     uint16_t nb_sys_ports = rte_eth_dev_count_avail();
@@ -123,6 +155,47 @@ static int ustack_encode_udp_pkt (uint8_t *msg, uint8_t *data, uint16_t total_le
     return 0;
 }
 
+// construct TCP msg
+static int ustack_encode_tcp_pkt(uint8_t *msg, uint16_t total_len) {
+    
+    // ether header
+    struct rte_ether_hdr *eth = (struct rte_ether_hdr *)msg;
+    rte_memcpy(eth->d_addr.addr_bytes, global_dmac, RTE_ETHER_ADDR_LEN);
+    rte_memcpy(eth->s_addr.addr_bytes, global_smac, RTE_ETHER_ADDR_LEN);
+    eth->ether_type = htons(RTE_ETHER_TYPE_IPV4);
+
+    // ip header
+    struct rte_ipv4_hdr *ip = (struct rte_ipv4_hdr*)(eth + 1); //msg + 
+    ip->version_ihl = 0x45;
+    ip->type_of_service = 0;
+    ip->total_length = htons(total_len - sizeof(struct rte_ether_hdr));
+    ip->packet_id = 0;
+    ip->fragment_offset = 0;
+    ip->time_to_live = 64;
+    ip->next_proto_id = IPPROTO_TCP;
+    ip->src_addr = global_sip;
+    ip->dst_addr = global_dip;
+    
+    // The checksum field must be set to 0 by the caller.
+    ip->hdr_checksum = 0;
+    ip->hdr_checksum = rte_ipv4_cksum(ip);
+
+    // tcp header
+    struct rte_tcp_hdr *tcp = (struct rte_tcp_hdr*)(ip + 1);
+    tcp->src_port = global_sport;
+    tcp->dst_port = global_dport;
+    tcp->sent_seq = htonl(12345); // 硬编码确定本端选定的初始序列号 ISN， 12346 为第一个数据字节序
+    tcp->recv_ack = htonl(global_seqnum + 1);
+    tcp->data_off = ((sizeof(struct rte_tcp_hdr) / 4) << 4); // = 0x50，高四位位tcp头部大小 中三位保留 最后一位为 NS（也可以被当做保留位）
+    tcp->tcp_flags = RTE_TCP_SYN_FLAG | RTE_TCP_ACK_FLAG;
+
+    tcp->rx_win = TCP_INIT_WINDOWS; //htons(4096);  // rmem
+	tcp->cksum = 0;
+	tcp->cksum = rte_ipv4_udptcp_cksum(ip, tcp);
+
+    return 0;
+}
+
 int main(int argc, char *argv[]) {
 
     if (rte_eal_init(argc, argv) < 0) {
@@ -138,7 +211,7 @@ int main(int argc, char *argv[]) {
 
     ustack_init_port(mbuf_pool);
 
-    // 主循环：持续轮询网卡 RX 队列并处理收到的报文 PMD
+    // PMD 主循环：持续轮询网卡 RX 队列并处理收到的报文
     while (1) {
         struct rte_mbuf *mbufs[BURST_SIZE] = {0};
 
@@ -178,7 +251,7 @@ int main(int argc, char *argv[]) {
                 continue;
             }
 
-            // 只处理 UDP 报文（此处假设 IP 头无 options，长度固定 20 字节）
+            // 处理 UDP 报文（此处假设 IP 头无 options，长度固定 20 字节）
             if(iphdr->next_proto_id == IPPROTO_UDP) {
                 // iphdr + 1 跳过 IP 头，指向 UDP 头
                 struct rte_udp_hdr *udphdr = (struct rte_udp_hdr *)(iphdr + 1);
@@ -219,6 +292,73 @@ int main(int argc, char *argv[]) {
 #endif  
                 printf("udp : %s\n", (char*)(udphdr + 1));
 
+                // 处理 TCP 报文
+            } else if (iphdr->next_proto_id == IPPROTO_TCP) {
+                struct rte_tcp_hdr *tcphdr = (struct rte_tcp_hdr *)(iphdr + 1);
+
+                rte_memcpy(global_smac, ethhdr->d_addr.addr_bytes, RTE_ETHER_ADDR_LEN);
+				rte_memcpy(global_dmac, ethhdr->s_addr.addr_bytes, RTE_ETHER_ADDR_LEN);
+
+				rte_memcpy(&global_sip, &iphdr->dst_addr, sizeof(uint32_t));
+				rte_memcpy(&global_dip, &iphdr->src_addr, sizeof(uint32_t));
+
+				rte_memcpy(&global_sport, &tcphdr->dst_port, sizeof(uint16_t));
+				rte_memcpy(&global_dport, &tcphdr->src_port, sizeof(uint16_t));
+
+                global_flags = tcphdr->tcp_flags;
+                global_seqnum = ntohl(tcphdr->sent_seq);
+                global_seqnum = ntohl(tcphdr->recv_ack);
+
+                struct in_addr addr;
+                addr.s_addr = iphdr->src_addr;
+                printf("TCP packet source IP %s:%d", inet_ntoa(addr), ntohs(tcphdr->src_port));
+
+                addr.s_addr = iphdr->dst_addr;
+                printf("Destinate IP %s:%d, flags: %x, seqnum: %d, acknum: %d\n",
+                    inet_ntoa(addr), ntohs(tcphdr->src_port), global_flags, global_seqnum, global_acknum);
+
+                if (global_flags & RTE_TCP_SYN_FLAG) {
+
+                    if (tcp_status == USTACK_TCP_STATUS_LISTEN) {
+                        uint16_t total_len = sizeof(struct rte_tcp_hdr) + sizeof(struct rte_ipv4_hdr) + sizeof(struct rte_ether_hdr);
+
+                        // lock-free malloc from rte_mempool
+                        struct rte_mbuf *mbuf = rte_pktmbuf_alloc(mbuf_pool);
+                        if (!mbuf) {
+                            rte_exit(EXIT_FAILURE, "Error rte_pktmbnuf_malloc\n");
+                        }
+                        mbuf->pkt_len = total_len;
+						mbuf->data_len = total_len;
+                        
+                        uint8_t *msg = rte_pktmbuf_mtod(mbuf, uint8_t *);
+                        ustack_encode_tcp_pkt(msg, total_len);
+                        rte_eth_tx_burst(global_portid, 0, &mbuf, 1);
+                        tcp_status = USTACK_TCP_STATUS_SYN_RCVD;
+                    }
+                }
+
+                if (global_flags & RTE_TCP_ACK_FLAG) {
+
+                    if (tcp_status == USTACK_TCP_STATUS_SYN_RCVD) {
+
+                        printf("enter established\n");
+                        tcp_status = USTACK_TCP_STATUS_ESTABLISHED;
+                    }
+
+                }
+                if (global_flags & RTE_TCP_PSH_FLAG) {
+
+                    printf("enter established: %d\n", tcp_status);
+                    if (tcp_status == USTACK_TCP_STATUS_ESTABLISHED) {
+
+						uint8_t hdrlen = (tcphdr->data_off >> 4) * sizeof(uint32_t);
+
+						uint8_t *data = ((uint8_t*)tcphdr + hdrlen);
+
+						printf("tcp data: %s\n", data);
+					}
+                    
+                }
             }
 
             // 将报文原样从同一端口回发；发送成功后 mbuf 归驱动所有，应用不能释放
