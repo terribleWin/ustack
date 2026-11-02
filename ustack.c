@@ -1,7 +1,10 @@
-/* ustack：基于 DPDK 的用户态协议栈实验程序、
-   实现最小的 DPDK 单线程轮询、全局变量、单连接假设、
-   做 SYN-ACK 和打印数据，当前实现 IPv4/UDP/TCP 收包打印与原样回发
-   实现基本的 ARP reply/ICMP  原样发回*/
+/* ustack：This program is a simple user-space TCP/IP stack demo based on DPDK, which is used for educational purposes.
+   This program implements a minimal DPDK single-threaded polling loop, global variables, and assumes a single connection.
+   It performs SYN-ACK and prints data, currently supporting IPv4/UDP/TCP packet reception, printing, and echoing back the original data.
+   It also implements basic ARP reply and ICMP echo reply functionality. 
+   This program will develop into a well-structured user-space TCP/IP stack in the future base on this demo, 
+   with supporting multiple connections, multi-threading, and more features.
+   Construct the running environment and compile the program. */
 
 #include <stdio.h>
 #include <string.h>
@@ -11,7 +14,7 @@
 #include <rte_ip.h>
 #include <arpa/inet.h>
 
-struct rte_mbuf* ustack_send(struct rte_mempool *mbuf_pool, unsigned char *data, uint16_t length);
+struct rte_mbuf* ustack_send_udp(struct rte_mempool *mbuf_pool, unsigned char *data, uint16_t length);
 
 int global_portid = 0;   /* 使用的端口号（对应第一个可用的 ethdev） */
 
@@ -27,7 +30,7 @@ int global_portid = 0;   /* 使用的端口号（对应第一个可用的 ethdev
 
 #define MAKE_IPV4_ADDR(a, b, c, d) (a + (b<<8) + (c<<16) + (d<<24))
 
-static uint32_t gLocalIp = MAKE_IPV4_ADDR(192, 168, 139, 137);
+static uint32_t gLocalIp = MAKE_IPV4_ADDR(192, 168, 139, 137); // 192168139137
 
 uint8_t global_smac[RTE_ETHER_ADDR_LEN];
 uint8_t global_dmac[RTE_ETHER_ADDR_LEN];
@@ -213,7 +216,7 @@ static int ustack_encode_tcp_pkt(uint8_t *msg, uint16_t total_len) {
     ip->src_addr = global_sip;
     ip->dst_addr = global_dip;
     
-    // The checksum field must be set to 0 by the caller.
+    // The checksum field must be set to 0 by the caller before caculate the checksum.
     ip->hdr_checksum = 0;
     ip->hdr_checksum = rte_ipv4_cksum(ip);
 
@@ -231,28 +234,6 @@ static int ustack_encode_tcp_pkt(uint8_t *msg, uint16_t total_len) {
 	tcp->cksum = rte_ipv4_udptcp_cksum(ip, tcp);
 
     return 0;
-}
-
-/// @brief this function is used to send UDP packet
-/// @param mbuf_pool the mbuf memory pool used to allocate mbuf
-/// @param data UDP send data
-/// @param length the lenght of UDP payload
-/// @return the construction of UDP packet, return the mbuf pointer 
-struct rte_mbuf* ustack_send(struct rte_mempool *mbuf_pool, unsigned char *data, uint16_t length) {
-
-    // mempool ---> mbuf
-    const unsigned total_len = length + 42;
-    struct rte_mbuf *mbuf = rte_pktmbuf_alloc(mbuf_pool);
-    if (!mbuf) {
-        rte_exit(EXIT_FAILURE, "Error rte_pktmbuf_alloc\n");
-    }
-
-    mbuf->pkt_len = total_len;
-    mbuf->data_len = total_len;
-
-    uint8_t *msg = rte_pktmbuf_mtod(mbuf, uint8_t *);
-    ustack_encode_udp_pkt(msg, data, total_len);
-    return mbuf;
 }
 
 // construct a ARP responce packet
@@ -283,6 +264,88 @@ static int ustack_encode_arp_pkt(uint8_t *msg, const uint8_t *dst_mac, uint32_t 
     return 0;
 }
 
+/// @brief construct an ICMP echo reply packet according to RFC 792
+/// @param msg the buffer used to store the constructed packet, containing the ethernet header, the ipv4 header and the icmp header
+/// @param dst_mac the destination mac address, that is the mac address of the ping requester
+/// @param sip the source ip address (the local ip) in network byte order
+/// @param dip the destination ip address (the requester ip) in network byte order
+/// @param icmp_ident the ICMP identifier, copied from the echo request as it is, no byte order conversion
+/// @param icmp_seq the ICMP sequence number, copied from the echo request as it is, no byte order conversion
+/// @return 0 on success, the constructed packet is filled into msg
+/// @note only the 8 bytes ICMP header is built here, the icmp data (payload) of the echo request is not copied back
+static int ustack_encode_icmp_pkt(uint8_t *msg, uint8_t *dst_mac, uint32_t sip, uint32_t dip, uint16_t icmp_ident, uint16_t icmp_seq) {
+
+    // ether header: source mac is the local mac, destination mac is the mac of the ping requester
+    struct rte_ether_hdr *eth = (struct rte_ether_hdr *)msg;
+    rte_memcpy(eth->s_addr.addr_bytes, global_smac, RTE_ETHER_ADDR_LEN);
+    rte_memcpy(eth->d_addr.addr_bytes, dst_mac, RTE_ETHER_ADDR_LEN);
+    eth->ether_type = htons(RTE_ETHER_TYPE_IPV4);
+
+    // ip header: no ip options here, so version_ihl is 0x45 (ihl * 4 = 20 bytes),
+    // total_length = ipv4 header + icmp header, because the icmp data is not carried in this demo
+    struct rte_ipv4_hdr *ip = (struct rte_ipv4_hdr*)(eth + 1); //msg + 
+    ip->version_ihl = 0x45;
+    ip->type_of_service = 0;
+    ip->total_length = htons(sizeof(struct rte_ipv4_hdr) + sizeof(struct rte_icmp_hdr));
+    ip->packet_id = 0;
+    ip->fragment_offset = 0;
+    ip->time_to_live = 64;
+    ip->next_proto_id = IPPROTO_ICMP;
+    ip->src_addr = sip;
+    ip->dst_addr = dip;
+
+    // The checksum field must be set to 0 by the caller.
+    ip->hdr_checksum = 0;
+    ip->hdr_checksum = rte_ipv4_cksum(ip);
+
+    // icmp header: type 0 and code 0 mean echo reply,
+    // the identifier and the sequence number must be kept the same as the echo request,
+    // otherwise the sender (ping) can not match the reply with its request
+    struct rte_icmp_hdr *icmp = (struct rte_icmp_hdr*)(ip + 1);
+    icmp->icmp_type = RTE_IP_ICMP_ECHO_REPLY; // reply to the request
+    icmp->icmp_code = 0;
+    icmp->icmp_ident = icmp_ident;
+    icmp->icmp_seq_nb = icmp_seq;
+    
+    // Caculate the ICMP checksum field.
+    // Cautions: the icmp checksum is calculated over the entire ICMP message, including the ICMP header and data as TCP\IP checksum.
+    // But there is no need to construct a pseundo header for ICMP checksum calculation.
+    // The checksum field must be set to 0 before calculating the checksum. 
+    // The checksum is then computed using the one's complement of the one's complement sum of all 16-bit words in the ICMP message. 
+    // If the length of the ICMP message is odd, a padding byte of 0 is added to make it even.
+    // There is no provided API for caculating the ICMP checksum in DPDK, so we need to implement it manually by given API.
+    uint8_t ip_hlen = (ip->version_ihl & 0x0F) * 4;
+    uint16_t icmp_len = ntohs(ip->total_length) - ip_hlen; // + data_len
+    icmp->icmp_cksum = 0;
+    uint16_t sum = (uint16_t)~rte_raw_cksum(icmp, icmp_len);   // cover ICMP head + data
+    icmp->icmp_cksum = sum ? sum : 0xffff;
+
+    return 0;
+}
+
+/// @brief this function is used to send UDP packet
+/// @param mbuf_pool the mbuf memory pool used to allocate mbuf
+/// @param data UDP send data
+/// @param length the lenght of UDP payload
+/// @return the construction of UDP packet, return the mbuf pointer 
+struct rte_mbuf* ustack_send_udp(struct rte_mempool *mbuf_pool, unsigned char *data, uint16_t length) {
+
+    // mempool ---> mbuf
+    const unsigned total_len = length + 42;
+    struct rte_mbuf *mbuf = rte_pktmbuf_alloc(mbuf_pool);
+    if (!mbuf) {
+        rte_exit(EXIT_FAILURE, "Error rte_pktmbuf_alloc\n");
+    }
+
+    mbuf->pkt_len = total_len;
+    mbuf->data_len = total_len;
+
+    uint8_t *msg = rte_pktmbuf_mtod(mbuf, uint8_t *);
+    ustack_encode_udp_pkt(msg, data, total_len);
+    return mbuf;
+}
+
+
 /* sip / dip 均为网络字节序；源 MAC 固定用 global_smac，不需要再传参 */
 static struct rte_mbuf* ustack_send_arp(struct rte_mempool *mbuf_pool, const uint8_t *dstmac, uint32_t sip, uint32_t dip) {
 
@@ -305,6 +368,31 @@ static struct rte_mbuf* ustack_send_arp(struct rte_mempool *mbuf_pool, const uin
     memset(pkt_data, 0, total_len);          /* 清空 padding 区，避免发出脏数据 */
     ustack_encode_arp_pkt(pkt_data, dstmac, sip, dip);
 
+    return mbuf;
+}
+
+/// @brief this function is used to send ICMP packet
+/// @param mbufpool the mbuf memory pool used to allocate mbuf
+/// @param dst_mac the destination mac address  
+/// @param sip the source ip address
+/// @param dip the destination ip address
+/// @param icmp_ident the ICMP identifier
+/// @param icmp_seq the ICMP sequence number
+/// @return the construction of ICMP packet, return the mbuf pointer
+static struct rte_mbuf* ustack_send_icmp(struct rte_mempool* mbufpool, uint8_t *dst_mac, uint32_t sip, uint32_t dip, uint16_t icmp_ident, uint16_t icmp_seq) {
+    
+    const unsigned total_len = sizeof(struct rte_ether_hdr) + sizeof(struct rte_ipv4_hdr) + sizeof(struct rte_icmp_hdr);
+    struct rte_mbuf *mbuf = rte_pktmbuf_alloc(mbufpool);
+    if (!mbuf) {
+        rte_exit(EXIT_FAILURE, "Error rte_pktmbuf_alloc\n");
+    }
+
+    mbuf->pkt_len = total_len;
+    mbuf->data_len = total_len;
+
+    uint8_t *msg = rte_pktmbuf_mtod(mbuf, uint8_t *);
+    ustack_encode_icmp_pkt(msg, dst_mac, sip, dip, icmp_ident, icmp_seq);
+    
     return mbuf;
 }
 
@@ -435,6 +523,22 @@ int main(int argc, char *argv[]) {
                 continue;
             }
 
+            // 处理 ICMP 报文
+            if (iphdr->next_proto_id == IPPROTO_ICMP) {
+
+                struct rte_icmp_hdr *icmp_hdr = (struct rte_icmp_hdr *)((uint8_t *)iphdr + ip_hdr_len);
+                if (icmp_hdr->icmp_type == RTE_IP_ICMP_ECHO_REQUEST) {
+
+                    struct rte_mbuf *icmp_mbuf = ustack_send_icmp(mbuf_pool, ethhdr->s_addr.addr_bytes, iphdr->dst_addr, iphdr->src_addr
+                                                , icmp_hdr->icmp_ident, icmp_hdr->icmp_seq_nb); 
+                    rte_eth_tx_burst(global_portid, 0, &icmp_mbuf, 1);
+                    rte_pktmbuf_free(icmp_mbuf);
+
+                    rte_pktmbuf_free(mbufs[i]);
+                    continue;
+                }
+            }
+
             // 处理 UDP 报文（此处假设 IP 头无 options，长度固定 20 字节）
             if(iphdr->next_proto_id == IPPROTO_UDP) {
                 // iphdr + 1 跳过 IP 头，指向 UDP 头
@@ -458,7 +562,7 @@ int main(int argc, char *argv[]) {
                 
                 uint16_t length = ntohs(udphdr->dgram_len) - sizeof(struct rte_udp_hdr);
 
-                struct rte_mbuf *udp_mbuf = ustack_send(mbuf_pool, (uint8_t *)(udphdr + 1), length);
+                struct rte_mbuf *udp_mbuf = ustack_send_udp(mbuf_pool, (uint8_t *)(udphdr + 1), length);
 
                 if (rte_eth_tx_burst(global_portid, 0, &udp_mbuf, 1) != 1)
                     rte_pktmbuf_free(udp_mbuf);
