@@ -345,7 +345,6 @@ struct rte_mbuf* ustack_send_udp(struct rte_mempool *mbuf_pool, unsigned char *d
     return mbuf;
 }
 
-
 /* sip / dip 均为网络字节序；源 MAC 固定用 global_smac，不需要再传参 */
 static struct rte_mbuf* ustack_send_arp(struct rte_mempool *mbuf_pool, const uint8_t *dstmac, uint32_t sip, uint32_t dip) {
 
@@ -457,13 +456,12 @@ int main(int argc, char *argv[]) {
                 addr.s_addr = arp_tip;
                 inet_ntop(AF_INET, &addr, tip_str, sizeof(tip_str));
 
-                // 处理目标 IP 为本机的 ARP 请求，发送 ARP 应答
-                if (arphdr->arp_opcode == rte_cpu_to_be_16(RTE_ARP_OP_REQUEST)) {
+                // 只处理与本机 IP 相关的 ARP：请求的目标 IP 或应答的目标 IP 必须是本机 IP
+                if (arp_tip == gLocalIp) {
 
-                    printf("ARP request: who has %s? tell %s\n", tip_str, sip_str);
+                    if (arphdr->arp_opcode == rte_cpu_to_be_16(RTE_ARP_OP_REQUEST)) {
 
-                    // 只应答询问本机 IP（192.168.139.137）的请求
-                    if (arp_tip == gLocalIp) {
+                        printf("ARP request: who has %s? tell %s\n", tip_str, sip_str);
 
                         // 单连接假设：把请求方 MAC 记为默认目的 MAC，只能记录一次对方 MAC 地址
                         // 真实的 MAC 地址需要处理 arp_table 和 arp_item 来处理多项 ARP 缓存表
@@ -480,19 +478,17 @@ int main(int argc, char *argv[]) {
 
                         if (arp_mbuf && rte_eth_tx_burst(global_portid, 0, &arp_mbuf, 1) != 1)
                             rte_pktmbuf_free(arp_mbuf);
+
+                    } else if (arphdr->arp_opcode == rte_cpu_to_be_16(RTE_ARP_OP_REPLY)) {
+
+                        // 学习 ARP 应答，后续主动发包时可直接使用该 MAC
+                        rte_memcpy(global_dmac, arphdr->arp_data.arp_sha.addr_bytes, RTE_ETHER_ADDR_LEN);
+
+                        printf("ARP reply: %s is at %02x:%02x:%02x:%02x:%02x:%02x\n", sip_str,
+                               arphdr->arp_data.arp_sha.addr_bytes[0], arphdr->arp_data.arp_sha.addr_bytes[1],
+                               arphdr->arp_data.arp_sha.addr_bytes[2], arphdr->arp_data.arp_sha.addr_bytes[3],
+                               arphdr->arp_data.arp_sha.addr_bytes[4], arphdr->arp_data.arp_sha.addr_bytes[5]);
                     }
-
-
-                    // 处理收到的 ARP 应答，学习对方 MAC 地址
-                } else if (arphdr->arp_opcode == rte_cpu_to_be_16(RTE_ARP_OP_REPLY)) {
-
-                    // 学习 ARP 应答，后续主动发包时可直接使用该 MAC
-                    rte_memcpy(global_dmac, arphdr->arp_data.arp_sha.addr_bytes, RTE_ETHER_ADDR_LEN);
-
-                    printf("ARP reply: %s is at %02x:%02x:%02x:%02x:%02x:%02x\n", sip_str,
-                           arphdr->arp_data.arp_sha.addr_bytes[0], arphdr->arp_data.arp_sha.addr_bytes[1],
-                           arphdr->arp_data.arp_sha.addr_bytes[2], arphdr->arp_data.arp_sha.addr_bytes[3],
-                           arphdr->arp_data.arp_sha.addr_bytes[4], arphdr->arp_data.arp_sha.addr_bytes[5]);
                 }
 
                 rte_pktmbuf_free(mbufs[i]);
