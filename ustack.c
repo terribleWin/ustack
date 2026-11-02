@@ -1,11 +1,17 @@
-/* ustack：基于 DPDK 的用户态协议栈实验程序（当前实现 IPv4/UDP 收包打印与原样回发） */
+/* ustack：基于 DPDK 的用户态协议栈实验程序、
+   实现最小的 DPDK 单线程轮询、全局变量、单连接假设、
+   做 SYN-ACK 和打印数据，当前实现 IPv4/UDP/TCP 收包打印与原样回发
+   实现基本的 ARP reply/ICMP  原样发回*/
 
 #include <stdio.h>
+#include <string.h>
 
 #include <rte_eal.h>
 #include <rte_ethdev.h>
 #include <rte_ip.h>
 #include <arpa/inet.h>
+
+struct rte_mbuf* ustack_send(struct rte_mempool *mbuf_pool, unsigned char *data, uint16_t length);
 
 int global_portid = 0;   /* 使用的端口号（对应第一个可用的 ethdev） */
 
@@ -18,6 +24,10 @@ int global_portid = 0;   /* 使用的端口号（对应第一个可用的 ethdev
 #define TCP_INIT_WINDOWS 14600
 
 #if ENABLE_SEND
+
+#define MAKE_IPV4_ADDR(a, b, c, d) (a + (b<<8) + (c<<16) + (d<<24))
+
+static uint32_t gLocalIp = MAKE_IPV4_ADDR(192, 168, 139, 137);
 
 uint8_t global_smac[RTE_ETHER_ADDR_LEN];
 uint8_t global_dmac[RTE_ETHER_ADDR_LEN];
@@ -73,6 +83,13 @@ static int ustack_init_port(struct rte_mempool *mbuf_pool) {
     struct rte_eth_dev_info dev_info;
     rte_eth_dev_info_get(global_portid, &dev_info);
 
+    printf("NIC Name: %s\n", dev_info.driver_name);
+    printf("TX Desc Min: %u, Max: %u, Align: %u\n", 
+       dev_info.tx_desc_lim.nb_min, 
+       dev_info.tx_desc_lim.nb_max, 
+       dev_info.tx_desc_lim.nb_align);
+
+
     // 配置端口的队列数量：1 个 RX 队列 + 1 个 TX 队列
     const int num_rx_queues = 1;
 #if ENABLE_SEND
@@ -113,6 +130,26 @@ static int ustack_init_port(struct rte_mempool *mbuf_pool) {
         rte_exit(EXIT_FAILURE, "Could not start\n");
     }
 
+    /* 关键：取出网卡真实硬件 MAC，作为本协议栈的源 MAC。
+       ARP 应答的以太网源地址、arp_sha，以及 TCP/UDP 发包的源地址都依赖 global_smac。
+       如果不在这里初始化，首次 ARP 应答会带 00:00:00:00:00:00，
+       对端把该 MAC 写入 ARP 缓存后，回包全部丢失。 */
+    struct rte_ether_addr mac;
+    rte_eth_macaddr_get(global_portid, &mac);
+    rte_memcpy(global_smac, mac.addr_bytes, RTE_ETHER_ADDR_LEN);
+
+    /* 目的 MAC 未知时先用广播，避免发出目的地址全 0 的帧 */
+    memset(global_dmac, 0xff, RTE_ETHER_ADDR_LEN);
+
+    /* 本机 IP，网络字节序（内存字节序与报文一致，可直接和 arp_tip 比较） */
+    global_sip = gLocalIp;
+
+    printf("local mac: %02x:%02x:%02x:%02x:%02x:%02x, local ip: %u.%u.%u.%u\n",
+           global_smac[0], global_smac[1], global_smac[2],
+           global_smac[3], global_smac[4], global_smac[5],
+           (uint8_t)(gLocalIp),     (uint8_t)(gLocalIp >> 8),
+           (uint8_t)(gLocalIp >> 16), (uint8_t)(gLocalIp >> 24));
+
     return 0;
 }
 
@@ -145,10 +182,10 @@ static int ustack_encode_udp_pkt (uint8_t *msg, uint8_t *data, uint16_t total_le
     struct rte_udp_hdr *udp = (struct rte_udp_hdr*)(ip + 1);
     udp->src_port = global_sport;
     udp->dst_port = global_dport;
-    uint16_t udplen = total_len - sizeof(struct rte_ether_hdr) - sizeof(struct rte_ipv4_hdr);
-    udp->dgram_len = htons(udplen);
+    uint16_t payload_len = total_len - sizeof(struct rte_ether_hdr) - sizeof(struct rte_ipv4_hdr) - sizeof(struct rte_udp_hdr);
+    udp->dgram_len = htons(payload_len + sizeof(struct rte_udp_hdr));
 
-    rte_memcpy((uint8_t *)(udp + 1), data, udplen);
+    rte_memcpy((uint8_t *)(udp + 1), data, payload_len);
     udp->dgram_cksum = 0;
     udp->dgram_cksum = rte_ipv4_udptcp_cksum(ip, udp);
 
@@ -196,6 +233,81 @@ static int ustack_encode_tcp_pkt(uint8_t *msg, uint16_t total_len) {
     return 0;
 }
 
+/// @brief this function is used to send UDP packet
+/// @param mbuf_pool the mbuf memory pool used to allocate mbuf
+/// @param data UDP send data
+/// @param length the lenght of UDP payload
+/// @return the construction of UDP packet, return the mbuf pointer 
+struct rte_mbuf* ustack_send(struct rte_mempool *mbuf_pool, unsigned char *data, uint16_t length) {
+
+    // mempool ---> mbuf
+    const unsigned total_len = length + 42;
+    struct rte_mbuf *mbuf = rte_pktmbuf_alloc(mbuf_pool);
+    if (!mbuf) {
+        rte_exit(EXIT_FAILURE, "Error rte_pktmbuf_alloc\n");
+    }
+
+    mbuf->pkt_len = total_len;
+    mbuf->data_len = total_len;
+
+    uint8_t *msg = rte_pktmbuf_mtod(mbuf, uint8_t *);
+    ustack_encode_udp_pkt(msg, data, total_len);
+    return mbuf;
+}
+
+// construct a ARP responce packet
+static int ustack_encode_arp_pkt(uint8_t *msg, const uint8_t *dst_mac, uint32_t sip, uint32_t dip) {
+
+    // ether header
+    struct rte_ether_hdr *eth = (struct rte_ether_hdr *)msg;
+    rte_memcpy(eth->s_addr.addr_bytes, global_smac, RTE_ETHER_ADDR_LEN);
+    rte_memcpy(eth->d_addr.addr_bytes, dst_mac, RTE_ETHER_ADDR_LEN);
+    eth->ether_type = htons(RTE_ETHER_TYPE_ARP);
+
+    // arp header
+    struct rte_arp_hdr *arp = (struct rte_arp_hdr *)(eth + 1);
+    arp->arp_hardware = htons(RTE_ARP_HRD_ETHER);
+    arp->arp_protocol = htons(RTE_ETHER_TYPE_IPV4);
+    arp->arp_hlen = RTE_ETHER_ADDR_LEN; // 
+    arp->arp_plen = sizeof(uint32_t);
+    arp->arp_opcode = htons(RTE_ARP_OP_REPLY);
+    
+    // aha 源 MAC 地址
+    rte_memcpy(arp->arp_data.arp_sha.addr_bytes, global_smac, RTE_ETHER_ADDR_LEN);
+    // tha 目标 MAC 地址
+    rte_memcpy(arp->arp_data.arp_tha.addr_bytes, dst_mac, RTE_ETHER_ADDR_LEN);
+
+    arp->arp_data.arp_sip = sip;
+    arp->arp_data.arp_tip = dip;
+
+    return 0;
+}
+
+/* sip / dip 均为网络字节序；源 MAC 固定用 global_smac，不需要再传参 */
+static struct rte_mbuf* ustack_send_arp(struct rte_mempool *mbuf_pool, const uint8_t *dstmac, uint32_t sip, uint32_t dip) {
+
+    /* ARP 帧只有 14 + 28 = 42 字节，短于以太网最小帧长
+       （60 字节，不含 CRC）。部分 PMD 不会自动填充，短帧可能被丢弃。 */
+    uint16_t total_len = sizeof(struct rte_ether_hdr) + sizeof(struct rte_arp_hdr);
+    const uint16_t min_len = RTE_ETHER_MIN_LEN - RTE_ETHER_CRC_LEN;
+    if (total_len < min_len)
+        total_len = min_len;
+
+    struct rte_mbuf* mbuf = rte_pktmbuf_alloc(mbuf_pool);
+    if (!mbuf) {
+        rte_exit(EXIT_FAILURE, "Error rte_pktmbuf_alloc\n");
+    }
+
+    mbuf->pkt_len = total_len;
+    mbuf->data_len = total_len;
+
+    uint8_t *pkt_data = rte_pktmbuf_mtod(mbuf, uint8_t *);
+    memset(pkt_data, 0, total_len);          /* 清空 padding 区，避免发出脏数据 */
+    ustack_encode_arp_pkt(pkt_data, dstmac, sip, dip);
+
+    return mbuf;
+}
+
 int main(int argc, char *argv[]) {
 
     if (rte_eal_init(argc, argv) < 0) {
@@ -227,7 +339,79 @@ int main(int argc, char *argv[]) {
             struct rte_ether_hdr *ethhdr = rte_pktmbuf_mtod(mbufs[i], struct rte_ether_hdr*);
             int sent = 0;
 
-            // 只处理 IPv4 报文，其它协议（ARP、IPv6 等）直接丢弃
+            // 处理 ARP 报文
+            if (ethhdr->ether_type == rte_cpu_to_be_16(RTE_ETHER_TYPE_ARP)) {
+
+                // 长度校验：不足一个完整 ARP 帧则丢弃，防止越界读
+                if (rte_pktmbuf_data_len(mbufs[i]) < sizeof(struct rte_ether_hdr) + sizeof(struct rte_arp_hdr)) {
+                    rte_pktmbuf_free(mbufs[i]);
+                    continue;
+                }
+
+                struct rte_arp_hdr *arphdr = rte_pktmbuf_mtod_offset(mbufs[i], struct rte_arp_hdr *, sizeof(struct rte_ether_hdr));
+
+                // 只处理 “以太网 + IPv4” 的 ARP，其余格式忽略
+                if (arphdr->arp_hardware != rte_cpu_to_be_16(RTE_ARP_HRD_ETHER) ||
+                    arphdr->arp_protocol != rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4) ||
+                    arphdr->arp_hlen != RTE_ETHER_ADDR_LEN ||
+                    arphdr->arp_plen != sizeof(uint32_t)) {
+                    rte_pktmbuf_free(mbufs[i]);
+                    continue;
+                }
+
+                const uint32_t arp_sip = arphdr->arp_data.arp_sip;   // 发送方 IP
+                const uint32_t arp_tip = arphdr->arp_data.arp_tip;   // 被询问的 IP
+
+                struct in_addr addr;
+                char sip_str[INET_ADDRSTRLEN], tip_str[INET_ADDRSTRLEN];
+                addr.s_addr = arp_sip;
+                inet_ntop(AF_INET, &addr, sip_str, sizeof(sip_str));
+                addr.s_addr = arp_tip;
+                inet_ntop(AF_INET, &addr, tip_str, sizeof(tip_str));
+
+                // 处理目标 IP 为本机的 ARP 请求，发送 ARP 应答
+                if (arphdr->arp_opcode == rte_cpu_to_be_16(RTE_ARP_OP_REQUEST)) {
+
+                    printf("ARP request: who has %s? tell %s\n", tip_str, sip_str);
+
+                    // 只应答询问本机 IP（192.168.139.137）的请求
+                    if (arp_tip == gLocalIp) {
+
+                        // 单连接假设：把请求方 MAC 记为默认目的 MAC，只能记录一次对方 MAC 地址
+                        // 真实的 MAC 地址需要处理 arp_table 和 arp_item 来处理多项 ARP 缓存表
+                        rte_memcpy(global_dmac, arphdr->arp_data.arp_sha.addr_bytes, RTE_ETHER_ADDR_LEN);
+
+                        printf("the opisite mac is %02x:%02x:%02x:%02x:%02x:%02x\n",
+                               global_dmac[0], global_dmac[1], global_dmac[2],
+                               global_dmac[3], global_dmac[4], global_dmac[5]);
+
+                        // ARP 应答的 SPA 必须是本机 IP，TPA 是请求方 IP
+                        struct rte_mbuf *arp_mbuf = ustack_send_arp(mbuf_pool,
+                                                        arphdr->arp_data.arp_sha.addr_bytes,
+                                                        gLocalIp, arp_sip);
+
+                        if (arp_mbuf && rte_eth_tx_burst(global_portid, 0, &arp_mbuf, 1) != 1)
+                            rte_pktmbuf_free(arp_mbuf);
+                    }
+
+
+                    // 处理收到的 ARP 应答，学习对方 MAC 地址
+                } else if (arphdr->arp_opcode == rte_cpu_to_be_16(RTE_ARP_OP_REPLY)) {
+
+                    // 学习 ARP 应答，后续主动发包时可直接使用该 MAC
+                    rte_memcpy(global_dmac, arphdr->arp_data.arp_sha.addr_bytes, RTE_ETHER_ADDR_LEN);
+
+                    printf("ARP reply: %s is at %02x:%02x:%02x:%02x:%02x:%02x\n", sip_str,
+                           arphdr->arp_data.arp_sha.addr_bytes[0], arphdr->arp_data.arp_sha.addr_bytes[1],
+                           arphdr->arp_data.arp_sha.addr_bytes[2], arphdr->arp_data.arp_sha.addr_bytes[3],
+                           arphdr->arp_data.arp_sha.addr_bytes[4], arphdr->arp_data.arp_sha.addr_bytes[5]);
+                }
+
+                rte_pktmbuf_free(mbufs[i]);
+                continue;
+            }
+
+            // 处理 IPv4 报文
             if (ethhdr->ether_type != rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4)) {
                 rte_pktmbuf_free(mbufs[i]);
                 continue;
@@ -272,22 +456,12 @@ int main(int argc, char *argv[]) {
                 addr.s_addr = iphdr->dst_addr;
                 printf("Destinate IP %s:%d -->", inet_ntoa(addr), ntohs(udphdr->dst_port));
                 
-                uint16_t length = ntohs(udphdr->dgram_len);
-                // UPD datagram + IPv4 header + ethernet header 
-                uint16_t total_len = length + sizeof(struct rte_ipv4_hdr) + sizeof(struct rte_ether_hdr);
+                uint16_t length = ntohs(udphdr->dgram_len) - sizeof(struct rte_udp_hdr);
 
-                struct rte_mbuf *mbuf = rte_pktmbuf_alloc(mbuf_pool);
-                if (!mbuf) {
-                    rte_exit(EXIT_FAILURE, "Error rte_pktmbuf_alloc\n");
-                }
+                struct rte_mbuf *udp_mbuf = ustack_send(mbuf_pool, (uint8_t *)(udphdr + 1), length);
 
-                mbuf->pkt_len = total_len;
-                mbuf->data_len = total_len;
-
-                uint8_t *msg = rte_pktmbuf_mtod(mbuf, uint8_t *);
-                ustack_encode_udp_pkt(msg, (uint8_t *)(udphdr + 1), total_len);
-
-                rte_eth_tx_burst(global_portid, 0, &mbuf, 1);
+                if (rte_eth_tx_burst(global_portid, 0, &udp_mbuf, 1) != 1)
+                    rte_pktmbuf_free(udp_mbuf);
 
 #endif  
                 printf("udp : %s\n", (char*)(udphdr + 1));
@@ -357,7 +531,7 @@ int main(int argc, char *argv[]) {
 
 						printf("tcp data: %s\n", data);
 					}
-                    
+
                 }
             }
 
