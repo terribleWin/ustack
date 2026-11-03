@@ -14,6 +14,8 @@
 #include <rte_ip.h>
 #include <arpa/inet.h>
 
+#include "arp.h"
+
 struct rte_mbuf* ustack_send_udp(struct rte_mempool *mbuf_pool, unsigned char *data, uint16_t length);
 
 int global_portid = 0;   /* 使用的端口号（对应第一个可用的 ethdev） */
@@ -314,6 +316,7 @@ static int ustack_encode_icmp_pkt(uint8_t *msg, uint8_t *dst_mac, uint32_t sip, 
     // The checksum is then computed using the one's complement of the one's complement sum of all 16-bit words in the ICMP message. 
     // If the length of the ICMP message is odd, a padding byte of 0 is added to make it even.
     // There is no provided API for caculating the ICMP checksum in DPDK, so we need to implement it manually by given API.
+    // For more about checksum:RFC 1071 - Computing the Internet Checksum
     uint8_t ip_hlen = (ip->version_ihl & 0x0F) * 4;
     uint16_t icmp_len = ntohs(ip->total_length) - ip_hlen; // + data_len
     icmp->icmp_cksum = 0;
@@ -459,6 +462,7 @@ int main(int argc, char *argv[]) {
                 // 只处理与本机 IP 相关的 ARP：请求的目标 IP 或应答的目标 IP 必须是本机 IP
                 if (arp_tip == gLocalIp) {
 
+                    // 收到 ARP Request，打印请求信息并发送 ARP Reply  
                     if (arphdr->arp_opcode == rte_cpu_to_be_16(RTE_ARP_OP_REQUEST)) {
 
                         printf("ARP request: who has %s? tell %s\n", tip_str, sip_str);
@@ -467,7 +471,7 @@ int main(int argc, char *argv[]) {
                         // 真实的 MAC 地址需要处理 arp_table 和 arp_item 来处理多项 ARP 缓存表
                         rte_memcpy(global_dmac, arphdr->arp_data.arp_sha.addr_bytes, RTE_ETHER_ADDR_LEN);
 
-                        printf("the opisite mac is %02x:%02x:%02x:%02x:%02x:%02x\n",
+                        printf("the opposite mac is %02x:%02x:%02x:%02x:%02x:%02x\n",
                                global_dmac[0], global_dmac[1], global_dmac[2],
                                global_dmac[3], global_dmac[4], global_dmac[5]);
 
@@ -479,10 +483,33 @@ int main(int argc, char *argv[]) {
                         if (arp_mbuf && rte_eth_tx_burst(global_portid, 0, &arp_mbuf, 1) != 1)
                             rte_pktmbuf_free(arp_mbuf);
 
+                            // 收到 ARP Reply，进行动态记录：
+                            // 1. 若表中不存在该 IP 映射，则新增一条记录。
+                            // 2. 若表中已存在该 IP 映射：
+                            //    - 如果 MAC 没变，刷新其老化时间（防止正在通信的缓存被误删）。
+                            //    - 如果 MAC 变了（如虚拟机迁移），直接覆盖旧的 MAC 地址。
                     } else if (arphdr->arp_opcode == rte_cpu_to_be_16(RTE_ARP_OP_REPLY)) {
+                        
+                        uint8_t *hwmac = ng_get_dst_macaddr(arphdr->arp_data.arp_sip);
+                        
+                        if (hwmac == NULL) {
+                            struct arp_table *table = arp_table_instance();
+                            struct arp_entry *entry = rte_malloc("arp_entry", sizeof(struct arp_entry), 0);
+                            
+                            if (entry) {
+                                memset(entry, 0, sizeof(struct arp_entry));
+                                entry->ip = arphdr->arp_data.arp_sip;
 
-                        // 学习 ARP 应答，后续主动发包时可直接使用该 MAC
-                        rte_memcpy(global_dmac, arphdr->arp_data.arp_sha.addr_bytes, RTE_ETHER_ADDR_LEN);
+                                // 6 字节 mac 地址拷贝到 arp_entry 结构体中 并且改变成状态
+                                rte_memcpy(entry->hwaddr, arphdr->arp_data.arp_sha.addr_bytes, RTE_ETHER_ADDR_LEN);
+                                entry->type = ARP_ENTRY_STATUS_DYNAMIC;
+
+                                LL_ADD(entry, table->entries);
+                                table->count ++;
+
+                            }
+                        
+                        }
 
                         printf("ARP reply: %s is at %02x:%02x:%02x:%02x:%02x:%02x\n", sip_str,
                                arphdr->arp_data.arp_sha.addr_bytes[0], arphdr->arp_data.arp_sha.addr_bytes[1],
