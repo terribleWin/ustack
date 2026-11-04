@@ -1,10 +1,31 @@
-/* ustack：This program is a simple user-space TCP/IP stack demo based on DPDK, which is used for educational purposes.
-   This program implements a minimal DPDK single-threaded polling loop, global variables, and assumes a single connection.
-   It performs SYN-ACK and prints data, currently supporting IPv4/UDP/TCP packet reception, printing, and echoing back the original data.
-   It also implements basic ARP reply and ICMP echo reply functionality. 
-   This program will develop into a well-structured user-space TCP/IP stack in the future base on this demo, 
-   with supporting multiple connections, multi-threading, and more features.
-   Construct the running environment and compile the program. */
+/*
+ * ustack - A DPDK-based user-space TCP/IP stack, written for educational purposes.
+ * 
+ * This file only demonstrates HOW to build a user-space protocol stack on DPDK:
+ * it is intentionally kept small and readable, not production-ready.
+ * 
+ * What it currently shows:
+ *   - A minimal single-threaded DPDK polling loop (rx burst -> parse -> tx burst).
+ *   - Global variables and a single-connection assumption, to keep the demo simple.
+ *   - ARP: answering requests for the local IP, sending periodic broadcast
+ *     requests over the whole subnet, and filling an ARP table from replies.
+ *   - ICMP: echo reply, so the stack can be pinged.
+ *   - IPv4/UDP/TCP: header parsing, printing, echoing the payload back,
+ *     and a SYN -> SYN/ACK -> ACK handshake demo.
+ * 
+ * Known limitations (intentional, for simplicity):
+ *   - The main loop and the protocol processing are still coupled together
+ *     in one while(1) block; they will be decoupled in later stages.
+ *   - No timers other than the ARP scan, no retransmission, no window control.
+ * 
+ * Roadmap (next stages):
+ *   1. Decouple the main loop from the protocol/business logic
+ *      (rx/tx cores + ring buffers, like the tcp.c sample in this repo).
+ *   2. Per-connection state instead of global variables, multiple connections.
+ *   3. Multi-threading and a proper timer framework.
+ * 
+ * Build: see the Makefile (make) and run with the DPDK EAL arguments.
+ */
 
 #include <stdio.h>
 #include <string.h>
@@ -12,11 +33,16 @@
 #include <rte_eal.h>
 #include <rte_ethdev.h>
 #include <rte_ip.h>
+#include <rte_timer.h>
+
 #include <arpa/inet.h>
+
 
 #include "arp.h"
 
 struct rte_mbuf* ustack_send_udp(struct rte_mempool *mbuf_pool, unsigned char *data, uint16_t length);
+
+int gDpdkPortId = 0;
 
 int global_portid = 0;   /* 使用的端口号（对应第一个可用的 ethdev） */
 
@@ -27,6 +53,9 @@ int global_portid = 0;   /* 使用的端口号（对应第一个可用的 ethdev
 #define ENABLE_TCP 1
 
 #define TCP_INIT_WINDOWS 14600
+#define TIMER_RESOLUTION_CYCLES 20000000ULL
+
+static uint8_t gDefaultArpMac[RTE_ETHER_ADDR_LEN] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
 
 #if ENABLE_SEND
 
@@ -34,7 +63,7 @@ int global_portid = 0;   /* 使用的端口号（对应第一个可用的 ethdev
 
 static uint32_t gLocalIp = MAKE_IPV4_ADDR(192, 168, 139, 137); // 192168139137
 
-uint8_t global_smac[RTE_ETHER_ADDR_LEN];
+uint8_t global_smac[RTE_ETHER_ADDR_LEN]; // global default source mac address
 uint8_t global_dmac[RTE_ETHER_ADDR_LEN];
 
 static uint32_t global_sip;
@@ -238,29 +267,66 @@ static int ustack_encode_tcp_pkt(uint8_t *msg, uint16_t total_len) {
     return 0;
 }
 
-// construct a ARP responce packet
-static int ustack_encode_arp_pkt(uint8_t *msg, const uint8_t *dst_mac, uint32_t sip, uint32_t dip) {
+/** 
+ * @brief This function is used to construct an ARP packet.
+ * 
+ * @details This function fills the fields of an ARP packet (including the Ethernet 
+ * header and the ARP payload) for both ARP Request and ARP Reply. 
+ * 
+ * ARP has specific characteristics based on its opcode:
+ * - For ARP Request (RTE_ARP_OP_REQUEST): The Ethernet destination MAC is set to 
+ *   the broadcast address (FF:FF:FF:FF:FF:FF), and the ARP target hardware address 
+ *   (ar$tha) is set to all zeros, indicating an unknown MAC.
+ * - For ARP Reply (RTE_ARP_OP_REPLY): Both the Ethernet destination MAC and the ARP 
+ *   target hardware address (ar$tha) are set to the actual unicast MAC of the peer.
+ *
+ * @param msg Pointer to the contiguous memory region of the mbuf (Ethernet frame start).
+ * @param opcode The ARP operation code (RTE_ARP_OP_REQUEST or RTE_ARP_OP_REPLY).
+ * @param dst_mac Pointer to the destination MAC address (used for unicast Reply).
+ * @param sip Source IP address (network byte order).
+ * @param dip Destination IP address (network byte order).
+ * @return 0 on success.
+ **/
+static int ustack_encode_arp_pkt(uint8_t *msg, uint16_t opcode, const uint8_t *dst_mac, uint32_t sip, uint32_t dip) {
 
     // ether header
     struct rte_ether_hdr *eth = (struct rte_ether_hdr *)msg;
+    // ethernet frame package
     rte_memcpy(eth->s_addr.addr_bytes, global_smac, RTE_ETHER_ADDR_LEN);
-    rte_memcpy(eth->d_addr.addr_bytes, dst_mac, RTE_ETHER_ADDR_LEN);
+
+    // fill up destinate mac address in the ethernet frame
+    if (opcode == RTE_ARP_OP_REQUEST) {
+        // ethernet destination: broadcast
+        uint8_t broadcast_mac[RTE_ETHER_ADDR_LEN] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+        rte_memcpy(eth->d_addr.addr_bytes, broadcast_mac, RTE_ETHER_ADDR_LEN);
+    } else {
+        rte_memcpy(eth->d_addr.addr_bytes, dst_mac, RTE_ETHER_ADDR_LEN);
+    }
+
     eth->ether_type = htons(RTE_ETHER_TYPE_ARP);
 
-    // arp header
+    // Fill up the arp header field
     struct rte_arp_hdr *arp = (struct rte_arp_hdr *)(eth + 1);
     arp->arp_hardware = htons(RTE_ARP_HRD_ETHER);
     arp->arp_protocol = htons(RTE_ETHER_TYPE_IPV4);
     arp->arp_hlen = RTE_ETHER_ADDR_LEN; // 
     arp->arp_plen = sizeof(uint32_t);
-    arp->arp_opcode = htons(RTE_ARP_OP_REPLY);
+    arp->arp_opcode = htons(opcode); // reply ---> opcode
     
-    // aha 源 MAC 地址
+    // aha 源 MAC IP 地址填充
     rte_memcpy(arp->arp_data.arp_sha.addr_bytes, global_smac, RTE_ETHER_ADDR_LEN);
-    // tha 目标 MAC 地址
-    rte_memcpy(arp->arp_data.arp_tha.addr_bytes, dst_mac, RTE_ETHER_ADDR_LEN);
-
     arp->arp_data.arp_sip = sip;
+
+    if (opcode == RTE_ARP_OP_REQUEST) {
+        // tha 目标 MAC 地址
+        uint8_t zero_mac[RTE_ETHER_ADDR_LEN] = {0};
+        rte_memcpy(arp->arp_data.arp_tha.addr_bytes, zero_mac, RTE_ETHER_ADDR_LEN); 
+    } else {
+        // arp reply: fill up the recieved destination mac address
+        rte_memcpy(arp->arp_data.arp_tha.addr_bytes, dst_mac, RTE_ETHER_ADDR_LEN);
+    }
+
+    // destination ip
     arp->arp_data.arp_tip = dip;
 
     return 0;
@@ -349,7 +415,7 @@ struct rte_mbuf* ustack_send_udp(struct rte_mempool *mbuf_pool, unsigned char *d
 }
 
 /* sip / dip 均为网络字节序；源 MAC 固定用 global_smac，不需要再传参 */
-static struct rte_mbuf* ustack_send_arp(struct rte_mempool *mbuf_pool, const uint8_t *dstmac, uint32_t sip, uint32_t dip) {
+static struct rte_mbuf* ustack_send_arp(struct rte_mempool *mbuf_pool, uint16_t opcode, const uint8_t *dstmac, uint32_t sip, uint32_t dip) {
 
     /* ARP 帧只有 14 + 28 = 42 字节，短于以太网最小帧长
        （60 字节，不含 CRC）。部分 PMD 不会自动填充，短帧可能被丢弃。 */
@@ -368,7 +434,7 @@ static struct rte_mbuf* ustack_send_arp(struct rte_mempool *mbuf_pool, const uin
 
     uint8_t *pkt_data = rte_pktmbuf_mtod(mbuf, uint8_t *);
     memset(pkt_data, 0, total_len);          /* 清空 padding 区，避免发出脏数据 */
-    ustack_encode_arp_pkt(pkt_data, dstmac, sip, dip);
+    ustack_encode_arp_pkt(pkt_data, opcode, dstmac, sip, dip);
 
     return mbuf;
 }
@@ -398,6 +464,58 @@ static struct rte_mbuf* ustack_send_icmp(struct rte_mempool* mbufpool, uint8_t *
     return mbuf;
 }
 
+/**
+ * @brief Callback function for periodic ARP request scanning.
+ * 
+ * @details This timer callback periodically broadcasts ARP Requests across 
+ * the entire local subnet (e.g., 192.168.139.1 to 192.168.139.254). 
+ * 
+ * The logic extracts the local network prefix (the first three octets) from 
+ * `gLocalIp` using a bitwise AND operation with 0x00FFFFFF. It then iterates 
+ * through all possible host IDs (1 to 254) and merges them back using a bitwise 
+ * OR operation. 
+ * 
+ * The purpose of retaining the network prefix is to ensure the broadcast stays 
+ * strictly within the local Layer-2 broadcast domain. ARP operates only within 
+ * the same subnet; retaining the prefix guarantees that the L2 switches and 
+ * hosts correctly receive and process the broadcast. If a different prefix were 
+ * used, the packets would be dropped or ignored. This mechanism actively warms 
+ * up and refreshes the local ARP cache table.
+ *
+ * @param[in] tim Pointer to the DPDK timer structure (unused).
+ * @param[in] arg Pointer to the memory pool used for allocating Mbufs.
+ */
+static void arp_request_timer_cb(__attribute__((unused)) struct rte_timer *tim,
+	  __attribute__((unused)) void *arg){
+        
+        struct rte_mempool *mbuf_pool = (struct rte_mempool*) arg;
+        
+        int i = 0;
+        for (i = 1; i<=254 ; i++) {
+        
+        uint32_t dstip = (gLocalIp & 0x00FFFFFF) | (0xFF000000 & (i << 24));
+        uint8_t* dstmac = ng_get_dst_macaddr(dstip);
+        
+        struct rte_mbuf *arp_mbuf = NULL;
+
+        if (dstmac == NULL) {
+
+            // send broadcast mac frame
+            arp_mbuf = ustack_send_arp(mbuf_pool, RTE_ARP_OP_REQUEST, gDefaultArpMac, gLocalIp, dstip);
+
+        } else {
+
+            arp_mbuf = ustack_send_arp(mbuf_pool, RTE_ARP_OP_REQUEST, dstmac, gLocalIp, dstip);
+
+        }
+        
+        if (rte_eth_tx_burst(gDpdkPortId, 0, &arp_mbuf, 1)!=1) {
+            rte_pktmbuf_free(arp_mbuf);
+        }
+    }
+
+}
+
 int main(int argc, char *argv[]) {
 
     if (rte_eal_init(argc, argv) < 0) {
@@ -412,6 +530,20 @@ int main(int argc, char *argv[]) {
     }
 
     ustack_init_port(mbuf_pool);
+
+    rte_eth_promiscuous_enable(global_portid); // 开启混杂模式，接收所有报文
+
+    rte_timer_subsystem_init();
+
+    struct rte_timer arp_timer;
+    rte_timer_init(&arp_timer);
+
+    uint64_t hz = rte_get_timer_hz();
+    unsigned lcore_id = rte_lcore_id();
+
+    // 在哪个核上，多久执行一次，执行对应的回调函数
+    rte_timer_reset(&arp_timer, hz, PERIODICAL, lcore_id, arp_request_timer_cb, mbuf_pool); 
+
 
     // PMD 主循环：持续轮询网卡 RX 队列并处理收到的报文
     while (1) {
@@ -474,9 +606,9 @@ int main(int argc, char *argv[]) {
                         printf("the opposite mac is %02x:%02x:%02x:%02x:%02x:%02x\n",
                                global_dmac[0], global_dmac[1], global_dmac[2],
                                global_dmac[3], global_dmac[4], global_dmac[5]);
-
-                        // ARP 应答的 SPA 必须是本机 IP，TPA 是请求方 IP
-                        struct rte_mbuf *arp_mbuf = ustack_send_arp(mbuf_pool,
+                        
+                        // 构造返回的 ARP reply
+                        struct rte_mbuf *arp_mbuf = ustack_send_arp(mbuf_pool, RTE_ARP_OP_REPLY, 
                                                         arphdr->arp_data.arp_sha.addr_bytes,
                                                         gLocalIp, arp_sip);
 
@@ -490,27 +622,8 @@ int main(int argc, char *argv[]) {
                             //    - 如果 MAC 变了（如虚拟机迁移），直接覆盖旧的 MAC 地址。
                     } else if (arphdr->arp_opcode == rte_cpu_to_be_16(RTE_ARP_OP_REPLY)) {
                         
-                        uint8_t *hwmac = ng_get_dst_macaddr(arphdr->arp_data.arp_sip);
+                        ng_arp_entry_insert(arphdr->arp_data.arp_sip, arphdr->arp_data.arp_sha.addr_bytes);
                         
-                        if (hwmac == NULL) {
-                            struct arp_table *table = arp_table_instance();
-                            struct arp_entry *entry = rte_malloc("arp_entry", sizeof(struct arp_entry), 0);
-                            
-                            if (entry) {
-                                memset(entry, 0, sizeof(struct arp_entry));
-                                entry->ip = arphdr->arp_data.arp_sip;
-
-                                // 6 字节 mac 地址拷贝到 arp_entry 结构体中 并且改变成状态
-                                rte_memcpy(entry->hwaddr, arphdr->arp_data.arp_sha.addr_bytes, RTE_ETHER_ADDR_LEN);
-                                entry->type = ARP_ENTRY_STATUS_DYNAMIC;
-
-                                LL_ADD(entry, table->entries);
-                                table->count ++;
-
-                            }
-                        
-                        }
-
                         printf("ARP reply: %s is at %02x:%02x:%02x:%02x:%02x:%02x\n", sip_str,
                                arphdr->arp_data.arp_sha.addr_bytes[0], arphdr->arp_data.arp_sha.addr_bytes[1],
                                arphdr->arp_data.arp_sha.addr_bytes[2], arphdr->arp_data.arp_sha.addr_bytes[3],
@@ -670,6 +783,18 @@ int main(int argc, char *argv[]) {
             if (!sent)
                 rte_pktmbuf_free(mbufs[i]);
         }
+
+        // 定时器
+        static uint64_t prev_tsc = 0, cur_tsc;
+        uint64_t diff_tsc;
+        
+        cur_tsc = rte_rdtsc();
+		diff_tsc = cur_tsc - prev_tsc;
+		if (diff_tsc > TIMER_RESOLUTION_CYCLES) {
+			rte_timer_manage();
+			prev_tsc = cur_tsc;
+		}
+
 
     }
 
