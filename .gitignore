@@ -2,3 +2,10 @@
 *.a
 *.exe
 build/
+
+# local reference material, not part of the project
+tcp-orig/
+tcp_demo.c
+tcp_concurrency.c
+plan.md
+record.md
