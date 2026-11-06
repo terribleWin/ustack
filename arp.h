@@ -54,6 +54,8 @@
 #define __NG_ARP_H__
 
 #include <pthread.h>
+#include <string.h>
+
 #include <rte_ether.h>
 #include <rte_cycles.h>
 #include <rte_malloc.h>
@@ -99,7 +101,7 @@ struct arp_table {
 };
 
 // 获取当前时间戳，单位毫秒
-static uint64_t get_current_time_ms() {
+static uint64_t get_current_time_ms(void) {
     return rte_get_timer_cycles() / (rte_get_timer_hz() / 1000);
 }
 
@@ -117,10 +119,27 @@ static struct  arp_table *arp_table_instance(void) {
 			rte_exit(EXIT_FAILURE, "rte_malloc arp table failed\n");
 		}
 		memset(arpt, 0, sizeof(struct  arp_table));
+		pthread_spin_init(&arpt->spinlock, 0);
 	}
 
 	return arpt;
 
+}
+
+/// @brief search ARP item by IP
+/// @param ip targeted IP
+/// @return return the hit entry, else return NULL
+static struct arp_entry *ng_arp_entry_lookup(uint32_t ip) {
+
+    struct arp_table *table = arp_table_instance();
+	struct arp_entry *iter;
+    for (iter = table->entries; iter != NULL; iter = iter->next) {
+        if (iter->ip == ip) {
+            return iter;
+        }
+    }
+
+    return NULL;
 }
 
 /// @brief 查找 arp 表中是否存在指定 IP 的条目
@@ -131,6 +150,8 @@ static uint8_t* ng_get_dst_macaddr(uint32_t dip) {
 	struct arp_entry *iter;
 	struct arp_table *table = arp_table_instance();
 
+	// iter = ng_arp_entry_lookup(dip);
+	// return iter->hwaddr;
 	for (iter = table->entries;iter != NULL;iter = iter->next) {
 		if (dip == iter->ip) {
 			return iter->hwaddr;
@@ -140,32 +161,52 @@ static uint8_t* ng_get_dst_macaddr(uint32_t dip) {
 	return NULL;
 }
 
-static int ng_arp_entry_insert(uint32_t ip, uint8_t *mac) {
+/// @brief This function is used to insert a arp item into the table
+/// @param ip The source IP 
+/// @param mac The source MAC address
+/// @return 1 if a new item is inserted, 0 if the item already exists and its ageing time is refreshed,
+///         -1 if the memory allocation failed
+static int ng_arp_entry_insert(uint32_t ip, const uint8_t *mac) {
 
 	struct arp_table *table = arp_table_instance();
+	uint64_t now = get_current_time_ms();
+	struct arp_entry *entry = ng_arp_entry_lookup(ip); // search the arp item
 
-	uint8_t *hwaddr = ng_get_dst_macaddr(ip);
-	if (hwaddr == NULL) {
+	// If this item exists, refresh the ageing time, and overwrite the mac when it changed
+	if (entry != NULL) {
+		pthread_spin_lock(&table->spinlock);
 
-		struct arp_entry *entry = rte_malloc("arp_entry",sizeof(struct arp_entry), 0);
-		if (entry) {
-			memset(entry, 0, sizeof(struct arp_entry));
-
-			entry->ip = ip;
+		if (memcmp(entry->hwaddr, mac, RTE_ETHER_ADDR_LEN) != 0) {
 			rte_memcpy(entry->hwaddr, mac, RTE_ETHER_ADDR_LEN);
-			entry->type = 0;
-
-			pthread_spin_lock(&table->spinlock);
-			LL_ADD(entry, table->entries);
-			table->count ++;
-			pthread_spin_unlock(&table->spinlock);
-			
 		}
 
-		return 1; //
+		entry->last_update_time = now;
+		entry->retry_count = 0;
+
+		pthread_spin_unlock(&table->spinlock);
+
+		return 0; // already exists, only refresh the ageing time
 	}
 
-	return 0;
+	// If this item does not exist, insert it into the table
+	entry = rte_malloc("arp_entry", sizeof(struct arp_entry), 0);
+	if (entry == NULL) return -1;
+
+	memset(entry, 0, sizeof(struct arp_entry));
+
+	entry->ip = ip;
+	rte_memcpy(entry->hwaddr, mac, RTE_ETHER_ADDR_LEN);
+	entry->type = ARP_ENTRY_STATUS_DYNAMIC;
+	entry->last_update_time = now;
+
+
+	pthread_spin_lock(&table->spinlock);
+	LL_ADD(entry, table->entries);
+	table->count ++;
+	pthread_spin_unlock(&table->spinlock);
+			
+	return 1; // insert successfully
+	
 }
 
 

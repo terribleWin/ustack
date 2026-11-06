@@ -14,8 +14,8 @@
  *     and a SYN -> SYN/ACK -> ACK handshake demo.
  * 
  * Known limitations (intentional, for simplicity):
- *   - The main loop and the protocol processing are still coupled together
- *     in one while(1) block; they will be decoupled in later stages.
+ *   - The main loop, the protocol processing and the application tasks entry are deoupled into
+ *     in three different while(1) block.Each block will run in a thread.
  *   - No timers other than the ARP scan, no retransmission, no window control.
  * 
  * Roadmap (next stages):
@@ -39,6 +39,8 @@
 
 
 #include "arp.h"
+#include "fd.h"
+#include "posix_api.h"
 
 struct rte_mbuf* ustack_send_udp(struct rte_mempool *mbuf_pool, unsigned char *data, uint16_t length);
 
@@ -46,8 +48,9 @@ int gDpdkPortId = 0;
 
 int global_portid = 0;   /* 使用的端口号（对应第一个可用的 ethdev） */
 
-#define NUM_MBUFS 4096   /* mbuf 内存池容量，决定可同时在途的收包缓冲区数量 */
+#define NUM_MBUFS (4096 - 1)   /* mbuf 内存池容量，决定可同时在途的收包缓冲区数量 */
 #define BURST_SIZE 128   /* 单次收包批量上限（rte_eth_rx_burst 一次最多收取的报文数） */
+#define RING_SIZE 1024
 
 #define ENABLE_SEND 1
 #define ENABLE_TCP 1
@@ -75,6 +78,30 @@ uint16_t global_dport;
 #endif
 
 #if ENABLE_TCP
+
+// This part is about the ringbuffer which transport data between PMD and APP thread
+// - PMD thread: process the received data from NICs, packet out the data
+// - APP thread: process the application data
+struct inout_ring {
+
+    struct rte_ring *in;
+    struct rte_ring *out;
+};
+
+//  Global Singleton inout_ring object
+static struct inout_ring *rInst = NULL;
+
+// Get the global singleton inout_ring instance
+static struct inout_ring *ringInstance(void) {
+
+    if (rInst == NULL) {
+        rInst = rte_malloc("in/out ring", sizeof(struct inout_ring), 0);
+        memset(rInst , 0, sizeof(struct inout_ring));
+    }
+
+    return rInst;
+
+}
 
 // 根据 RFC 793 建立 TCP 三次握手状态机
 typedef enum __USTACK_TCP_STATUS {
@@ -187,13 +214,15 @@ static int ustack_init_port(struct rte_mempool *mbuf_pool) {
     return 0;
 }
 
-// construct UDP msg
-static int ustack_encode_udp_pkt (uint8_t *msg, uint8_t *data, uint16_t total_len) {
+// Fill the UDP fields.
+static int ustack_encode_udp_pkt (uint8_t *msg, uint32_t sip, uint32_t dip,
+    uint16_t sport, uint16_t dport, uint8_t *srcmac, uint8_t *dstmac,
+    unsigned char* data, uint16_t total_len) {
 
     // ether header
     struct rte_ether_hdr *eth = (struct rte_ether_hdr *)msg;
-    rte_memcpy(eth->d_addr.addr_bytes, global_dmac, RTE_ETHER_ADDR_LEN);
-    rte_memcpy(eth->s_addr.addr_bytes, global_smac, RTE_ETHER_ADDR_LEN);
+    rte_memcpy(eth->d_addr.addr_bytes, dstmac, RTE_ETHER_ADDR_LEN);
+    rte_memcpy(eth->s_addr.addr_bytes, srcmac, RTE_ETHER_ADDR_LEN);
     eth->ether_type = htons(RTE_ETHER_TYPE_IPV4);
 
     // ip header
@@ -205,8 +234,8 @@ static int ustack_encode_udp_pkt (uint8_t *msg, uint8_t *data, uint16_t total_le
     ip->fragment_offset = 0;
     ip->time_to_live = 64;
     ip->next_proto_id = IPPROTO_UDP;
-    ip->src_addr = global_sip;
-    ip->dst_addr = global_dip;
+    ip->src_addr = sip;
+    ip->dst_addr = dip;
 
     // The checksum field must be set to 0 by the caller.
     ip->hdr_checksum = 0;
@@ -214,9 +243,12 @@ static int ustack_encode_udp_pkt (uint8_t *msg, uint8_t *data, uint16_t total_le
     
     // udp header
     struct rte_udp_hdr *udp = (struct rte_udp_hdr*)(ip + 1);
-    udp->src_port = global_sport;
-    udp->dst_port = global_dport;
-    uint16_t payload_len = total_len - sizeof(struct rte_ether_hdr) - sizeof(struct rte_ipv4_hdr) - sizeof(struct rte_udp_hdr);
+    udp->src_port = sport;
+    udp->dst_port = dport;
+
+    uint16_t payload_len = total_len - sizeof(struct rte_ether_hdr) 
+                                     - sizeof(struct rte_ipv4_hdr) 
+                                     - sizeof(struct rte_udp_hdr);
     udp->dgram_len = htons(payload_len + sizeof(struct rte_udp_hdr));
 
     rte_memcpy((uint8_t *)(udp + 1), data, payload_len);
@@ -224,6 +256,26 @@ static int ustack_encode_udp_pkt (uint8_t *msg, uint8_t *data, uint16_t total_le
     udp->dgram_cksum = rte_ipv4_udptcp_cksum(ip, udp);
 
     return 0;
+}
+
+// Get a mbuf from the memory pool, and fill the UDP fields.return the mbuf.
+static struct ret_mbuf *ustack_udp_pkt (struct rte_mempool *mbuf_pool, uint32_t sip, uint32_t dip, uint16_t sport, uint16_t dport, 
+            const uint8_t *srcmac, const uint8_t *dstmac, const uint8_t *data, uint16_t length) {
+
+    const uint16_t total_len = sizeof(struct rte_ether_hdr) + sizeof(struct rte_ipv4_hdr) + 
+                                sizeof(struct rte_udp_hdr) + length;
+    struct rte_mbuf *mbuf = rte_pktmbuf_alloc(mbuf_pool);
+    if (mbuf == NULL) {
+        return NULL;
+    }
+
+    mbuf->pkt_len = total_len;
+    mbuf->data_len = total_len;
+    
+    uint8_t *pkt = rte_pktmbuf_mtod(mbuf, uint8_t *);
+    ustack_encode_udp_pkt(pkt, sip, dip, sport, dport, srcmac, dstmac, data, total_len);
+
+    return mbuf;
 }
 
 // construct TCP msg
@@ -392,6 +444,7 @@ static int ustack_encode_icmp_pkt(uint8_t *msg, uint8_t *dst_mac, uint32_t sip, 
     return 0;
 }
 
+#if 0
 /// @brief this function is used to send UDP packet
 /// @param mbuf_pool the mbuf memory pool used to allocate mbuf
 /// @param data UDP send data
@@ -414,6 +467,7 @@ struct rte_mbuf* ustack_send_udp(struct rte_mempool *mbuf_pool, unsigned char *d
     return mbuf;
 }
 
+#endif
 /* sip / dip 均为网络字节序；源 MAC 固定用 global_smac，不需要再传参 */
 static struct rte_mbuf* ustack_send_arp(struct rte_mempool *mbuf_pool, uint16_t opcode, const uint8_t *dstmac, uint32_t sip, uint32_t dip) {
 
@@ -489,9 +543,10 @@ static void arp_request_timer_cb(__attribute__((unused)) struct rte_timer *tim,
 	  __attribute__((unused)) void *arg){
         
         struct rte_mempool *mbuf_pool = (struct rte_mempool*) arg;
-        
+        struct inout_ring *ring =  ringInstance();
+
         int i = 0;
-        for (i = 1; i<=254 ; i++) {
+        for (i = 1; i <= 254 ; i++) {
         
         uint32_t dstip = (gLocalIp & 0x00FFFFFF) | (0xFF000000 & (i << 24));
         uint8_t* dstmac = ng_get_dst_macaddr(dstip);
@@ -509,11 +564,750 @@ static void arp_request_timer_cb(__attribute__((unused)) struct rte_timer *tim,
 
         }
         
-        if (rte_eth_tx_burst(gDpdkPortId, 0, &arp_mbuf, 1)!=1) {
-            rte_pktmbuf_free(arp_mbuf);
+        //if (rte_eth_tx_burst(gDpdkPortId, 0, &arp_mbuf, 1)!=1) 
+        //    rte_pktmbuf_free(arp_mbuf);
+        
+       rte_ring_mp_enqueue_burst(ring->out ,(void**)&arp_mbuf, 1, NULL);
+
+    }
+
+}
+
+/// @brief This is a UDP connection control block.
+/// Data after processing in the TCP/IP stack would be store at sndbuf so that 
+/// the application thread could recieve these data and process them
+/// When application layer wants to send data, they coule store the data into the rcvbuf.
+/// Every real connect will allocate a udp_sock object.
+struct ustack_udp_sock { // tcp.c : localhost Linux : struct udp_sock (UDP tcb)
+
+    // TODO: sockfd 做非阻塞、阻塞
+    int fd;
+
+    int bflags;
+    uint32_t localip; // ip --> mac
+    uint8_t localmac[RTE_ETHER_ADDR_LEN];
+    uint16_t localport;
+
+    uint8_t protocol;
+    
+    struct rte_ring *sndbuf;
+    struct rte_ring *rcvbuf;
+
+    struct ustack_udp_sock *prev;
+    struct ustack_udp_sock *next;
+
+    pthread_cond_t cond;
+    pthread_mutex_t mutex;
+};
+
+// Global singleton list head  
+static struct ustack_udp_sock *lhost = NULL;
+
+// UDP offload
+struct ustack_offload {
+
+    uint32_t sip;
+    uint32_t dip;
+    uint16_t sport, dport;
+
+    int protocol;
+    
+    unsigned char* data;
+    uint16_t length; // total length
+
+};
+
+/**
+ * @brief Process the UDP datagram in the pkt_process main loop.
+ * 
+ * @param[in] udpmbuf Pointer to the UDP datagram.
+ * @return 
+ *  -  0: Success; offload enqueue._PROCESS
+ *  - -1: udpmbuf would be free.
+ *  - -2: datat could not allocate.
+ */
+static int udp_process(struct rte_mbuf *udpmbuf) {
+
+                struct rte_ipv4_hdr *iphdr =  rte_pktmbuf_mtod_offset(udpmbuf, struct rte_ipv4_hdr *, 
+				                                sizeof(struct rte_ether_hdr));
+                
+                uint16_t ip_hdr_len = (iphdr->version_ihl & 0x0f) * 4;
+
+                 // Dynamic caculate ip headerlength :iphdr + 1 跳过 IP 头，指向 UDP 头 
+                struct rte_udp_hdr *udphdr = (struct rte_udp_hdr *)((uint8_t*)iphdr + ip_hdr_len);
+
+                uint16_t ip_total_len = ntohs(iphdr->total_length); // IP 包整体长度
+                uint16_t dgram_len = ntohs(udphdr->dgram_len); //UDP 整体长度
+                if (dgram_len < 8 ||
+                    ip_hdr_len + dgram_len > ip_total_len ||
+                    sizeof(struct rte_ether_hdr) + ip_total_len > rte_pktmbuf_pkt_len(udpmbuf)) {
+                    rte_pktmbuf_free(udpmbuf);
+                    return -1;
+                }
+
+                struct in_addr addr;
+                addr.s_addr = iphdr->src_addr;
+                printf("udp_process ---> src: %s:%d \n", inet_ntoa(addr), ntohs(udphdr->src_port));
+
+                struct ustack_udp_sock *host = get_hostinfo_fromip_port(iphdr->dst_addr, udphdr->dst_port, iphdr->next_proto_id);
+                if (host == NULL) {
+                    rte_pktmbuf_free(udpmbuf);
+                    return -3;
+                }
+                
+                struct ustack_offload *ol = rte_malloc("offload", sizeof(struct ustack_offload), 0);
+                if (ol == NULL) {
+                    rte_pktmbuf_free(udpmbuf);
+                    return -1;
+                }
+
+                ol->dip = iphdr->dst_addr;
+                ol->sip = iphdr->src_addr;
+                ol->sport = udphdr->src_port;
+                ol->dport = udphdr->dst_port;
+
+                ol->protocol = IPPROTO_UDP;
+                ol->length = ntohs(udphdr->dgram_len); // total length.
+
+                ol->data = rte_malloc("unsigned char*", ol->length - sizeof(struct rte_udp_hdr), 0);
+                if (ol->data == NULL) {
+                    rte_pktmbuf_free(udpmbuf);
+                    rte_free(ol);
+                    return -2;
+                }
+                rte_memcpy(ol->data, (unsigned char*)(udphdr + 1), ol->length - sizeof(struct rte_udp_hdr));
+
+                // There is necessary to consider whether enqueue or not.
+                if (rte_ring_mp_enqueue(host->rcvbuf, ol) != 0) {
+                    rte_free(ol->data); 
+                    rte_free(ol); 
+                    rte_pktmbuf_free(udpmbuf);
+                    return -5;
+                }
+
+                pthread_mutex_lock(&host->mutex);
+                pthread_cond_signal(&host->cond);
+                pthread_mutex_unlock(&host->mutex);
+
+                rte_pktmbuf_free(udpmbuf);
+
+                return 0;
+}
+
+int udp_out(struct rte_mempool *mbuf_pool) {
+    struct ustack_udp_sock* host;
+    for (host = lhost; host != NULL; host = host->next) {
+        
+        struct ustack_offload *ol;
+
+        // 每一次只从 sndbuf 之中取一个数据包，sndbuf 积压 n个包需要pkt_process处理n轮循环才能取出来。
+        int nb_snd= rte_ring_mc_dequeue(host->sndbuf, (void**)&ol);
+        if (nb_snd < 0) continue;
+        
+        struct in_addr addr;
+        addr.s_addr = ol->dip;
+        printf("udp_out ---> src :%s:%d \n", inet_ntoa(addr), ntohs(ol->dport));
+
+        struct inout_ring *ring = ringInstance();
+
+        uint8_t *dstmac = ng_get_dst_macaddr(ol->dip);
+        // 如果找不到目的 MAC 地址，构造 ARP request发送
+        if(dstmac == NULL) {
+            struct rte_mbuf *arpbuf = ustack_send_arp(mbuf_pool, RTE_ARP_OP_REQUEST, gDefaultArpMac,
+                                                ol->sip, ol->dip);
+
+            if (rte_ring_mp_enqueue_burst(ring->out, (void**)&arpbuf, 1, NULL) != 1) {
+                rte_pktmbuf_free(arpbuf);
+            }
+
+             /* 数据先放回 sndbuf，等 ARP 表更新后再发 */
+            rte_ring_mp_enqueue(host->sndbuf, ol);
+            continue;
+        } else {
+            struct rte_mbuf *udpbuf = ustack_udp_pkt(mbuf_pool,
+                                                      ol->sip, ol->dip, ol->sport, ol->dport, host->localmac,
+                                                      dstmac, ol->data, ol->length);
+            if (udpbuf != NULL && rte_ring_mp_enqueue_burst(ring->out, (void**)&udpbuf, 1, NULL) != 1) {
+                rte_pktmbuf_free(udpbuf);
+            }
+
+            rte_free(ol->data);
+            rte_free(ol);
         }
     }
 
+    return 0;
+}
+
+// Multi thread
+static int pkt_process(__attribute__((unused)) void *arg) {
+    
+    struct rte_mempool *mbuf_pool = (struct rte_mempool *)arg;
+    struct inout_ring *ring = ringInstance();
+
+    while (1) {
+
+        struct rte_mbuf *mbufs[BURST_SIZE];
+        unsigned num_recvd = rte_ring_mc_dequeue_burst(ring->in, (void**)mbufs, BURST_SIZE, NULL);
+
+        for (unsigned i = 0; i < num_recvd ;i++) {
+
+            struct rte_ether_hdr *ethhdr = rte_pktmbuf_mtod(mbufs[i], struct rte_ether_hdr*);
+
+            // 处理 ARP 报文
+            if (ethhdr->ether_type == rte_cpu_to_be_16(RTE_ETHER_TYPE_ARP)) {
+
+                // 长度校验：不足一个完整 ARP 帧则丢弃，防止越界读
+                if (rte_pktmbuf_data_len(mbufs[i]) < sizeof(struct rte_ether_hdr) + sizeof(struct rte_arp_hdr)) {
+                    rte_pktmbuf_free(mbufs[i]);
+                    continue;
+                }
+
+                struct rte_arp_hdr *arphdr = rte_pktmbuf_mtod_offset(mbufs[i], struct rte_arp_hdr *, sizeof(struct rte_ether_hdr));
+
+                // 只处理 “以太网 + IPv4” 的 ARP，其余格式忽略
+                if (arphdr->arp_hardware != rte_cpu_to_be_16(RTE_ARP_HRD_ETHER) ||
+                    arphdr->arp_protocol != rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4) ||
+                    arphdr->arp_hlen != RTE_ETHER_ADDR_LEN ||
+                    arphdr->arp_plen != sizeof(uint32_t)) {
+                    rte_pktmbuf_free(mbufs[i]);
+                    continue;
+                }
+
+                const uint32_t arp_sip = arphdr->arp_data.arp_sip;   // 发送方 IP
+                const uint32_t arp_tip = arphdr->arp_data.arp_tip;   // 被询问的 IP
+
+                struct in_addr addr;
+                char sip_str[INET_ADDRSTRLEN], tip_str[INET_ADDRSTRLEN];
+                addr.s_addr = arp_sip;
+                inet_ntop(AF_INET, &addr, sip_str, sizeof(sip_str));
+                addr.s_addr = arp_tip;
+                inet_ntop(AF_INET, &addr, tip_str, sizeof(tip_str));
+
+                // 只处理与本机 IP 相关的 ARP：请求的目标 IP 或应答的目标 IP 必须是本机 IP
+                if (arp_tip == gLocalIp) {
+
+                    // 收到 ARP Request，打印请求信息并发送 ARP Reply  
+                    if (arphdr->arp_opcode == rte_cpu_to_be_16(RTE_ARP_OP_REQUEST)) {
+
+                        printf("ARP request: who has %s? tell %s\n", tip_str, sip_str);
+
+                        // 单连接假设：把请求方 MAC 记为默认目的 MAC，只能记录一次对方 MAC 地址
+                        // 真实的 MAC 地址需要处理 arp_table 和 arp_item 来处理多项 ARP 缓存表
+                        rte_memcpy(global_dmac, arphdr->arp_data.arp_sha.addr_bytes, RTE_ETHER_ADDR_LEN);
+
+                        printf("the opposite mac is %02x:%02x:%02x:%02x:%02x:%02x\n",
+                               global_dmac[0], global_dmac[1], global_dmac[2],
+                               global_dmac[3], global_dmac[4], global_dmac[5]);
+                        
+                        // 构造返回的 ARP reply
+                        struct rte_mbuf *arp_mbuf = ustack_send_arp(mbuf_pool, RTE_ARP_OP_REPLY, 
+                                                        arphdr->arp_data.arp_sha.addr_bytes,
+                                                        gLocalIp, arp_sip);
+
+                        //if (arp_mbuf && rte_eth_tx_burst(global_portid, 0, &arp_mbuf, 1) != 1)
+                        //    rte_pktmbuf_free(arp_mbuf);
+
+                            if (rte_ring_mp_enqueue_burst(ring->out, (void**)&arp_mbuf, 1, NULL) != NULL) {
+                                rte_pktmbuf_free(arp_mbuf);
+                            }
+
+                            // 收到 ARP Reply，进行动态记录：
+                            // 1. 若表中不存在该 IP 映射，则新增一条记录。
+                            // 2. 若表中已存在该 IP 映射：
+                            //    - 如果 MAC 没变，刷新其老化时间（防止正在通信的缓存被误删）。
+                            //    - 如果 MAC 变了（如虚拟机迁移），直接覆盖旧的 MAC 地址。
+                    } else if (arphdr->arp_opcode == rte_cpu_to_be_16(RTE_ARP_OP_REPLY)) {
+                        
+                        ng_arp_entry_insert(arphdr->arp_data.arp_sip, arphdr->arp_data.arp_sha.addr_bytes);
+                        
+                        printf("ARP reply: %s is at %02x:%02x:%02x:%02x:%02x:%02x\n", sip_str,
+                               arphdr->arp_data.arp_sha.addr_bytes[0], arphdr->arp_data.arp_sha.addr_bytes[1],
+                               arphdr->arp_data.arp_sha.addr_bytes[2], arphdr->arp_data.arp_sha.addr_bytes[3],
+                               arphdr->arp_data.arp_sha.addr_bytes[4], arphdr->arp_data.arp_sha.addr_bytes[5]);
+                    }
+                }
+
+                rte_pktmbuf_free(mbufs[i]);
+                continue;
+            }
+
+            // 处理 IPv4 报文
+            if (ethhdr->ether_type != rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4)) {
+                rte_pktmbuf_free(mbufs[i]);
+                continue;
+            }
+
+            // 跳过 14 字节以太网头，定位 IPv4 头
+            struct rte_ipv4_hdr *iphdr = rte_pktmbuf_mtod_offset(mbufs[i], struct rte_ipv4_hdr *, sizeof(struct rte_ether_hdr));
+
+            uint8_t version = iphdr->version_ihl >> 4;
+            uint8_t ihl     = iphdr->version_ihl & RTE_IPV4_HDR_IHL_MASK; 
+            
+            // 兼容带 options 的 IPv4 头部
+            if (version != 4 || ihl < RTE_IPV4_MIN_IHL) {
+                rte_pktmbuf_free(mbufs[i]);
+                continue;
+            }
+            uint16_t ip_hdr_len = ihl * RTE_IPV4_IHL_MULTIPLIER;
+
+            if (ip_hdr_len > rte_pktmbuf_pkt_len(mbufs[i]) - sizeof(struct rte_ether_hdr)) {
+                rte_pktmbuf_free(mbufs[i]);
+                continue;
+            }
+
+            // 处理 ICMP 报文
+            if (iphdr->next_proto_id == IPPROTO_ICMP) {
+
+                struct rte_icmp_hdr *icmp_hdr = (struct rte_icmp_hdr *)((uint8_t *)iphdr + ip_hdr_len);
+                if (icmp_hdr->icmp_type == RTE_IP_ICMP_ECHO_REQUEST) {
+
+                    struct rte_mbuf *icmp_mbuf = ustack_send_icmp(mbuf_pool, ethhdr->s_addr.addr_bytes, iphdr->dst_addr, iphdr->src_addr
+                                                , icmp_hdr->icmp_ident, icmp_hdr->icmp_seq_nb); 
+                    
+                //if (rte_eth_tx_burst(global_portid, 0, &icmp_mbuf, 1) != 1) 
+                //    rte_pktmbuf_free(icmp_mbuf);
+                
+
+                if (rte_ring_mp_enqueue_burst(ring->out, (void**)&icmp_mbuf, 1, NULL) != 1){
+                    rte_pktmbuf_free(icmp_mbuf);
+                }
+                    continue;
+                }
+            }
+
+            // 处理 UDP 报文（此处假设 IP 头无 options，长度固定 20 字节）
+            if(iphdr->next_proto_id == IPPROTO_UDP) {
+              
+                udp_process(mbufs[i]);
+
+                // 处理 TCP 报文
+            } else if (iphdr->next_proto_id == IPPROTO_TCP) {
+                struct rte_tcp_hdr *tcphdr = (struct rte_tcp_hdr *)(iphdr + 1);
+
+                rte_memcpy(global_smac, ethhdr->d_addr.addr_bytes, RTE_ETHER_ADDR_LEN);
+				rte_memcpy(global_dmac, ethhdr->s_addr.addr_bytes, RTE_ETHER_ADDR_LEN);
+
+				rte_memcpy(&global_sip, &iphdr->dst_addr, sizeof(uint32_t));
+				rte_memcpy(&global_dip, &iphdr->src_addr, sizeof(uint32_t));
+
+				rte_memcpy(&global_sport, &tcphdr->dst_port, sizeof(uint16_t));
+				rte_memcpy(&global_dport, &tcphdr->src_port, sizeof(uint16_t));
+
+                global_flags = tcphdr->tcp_flags;
+                global_seqnum = ntohl(tcphdr->sent_seq);
+                global_seqnum = ntohl(tcphdr->recv_ack);
+
+                struct in_addr addr;
+                addr.s_addr = iphdr->src_addr;
+                printf("TCP packet source IP %s:%d", inet_ntoa(addr), ntohs(tcphdr->src_port));
+
+                addr.s_addr = iphdr->dst_addr;
+                printf("Destinate IP %s:%d, flags: %x, seqnum: %d, acknum: %d\n",
+                    inet_ntoa(addr), ntohs(tcphdr->src_port), global_flags, global_seqnum, global_acknum);
+
+                if (global_flags & RTE_TCP_SYN_FLAG) {
+
+                    if (tcp_status == USTACK_TCP_STATUS_LISTEN) {
+                        uint16_t total_len = sizeof(struct rte_tcp_hdr) + sizeof(struct rte_ipv4_hdr) + sizeof(struct rte_ether_hdr);
+
+                        // lock-free malloc from rte_mempool
+                        struct rte_mbuf *mbuf = rte_pktmbuf_alloc(mbuf_pool);
+                        if (!mbuf) {
+                            rte_exit(EXIT_FAILURE, "Error rte_pktmbnuf_malloc\n");
+                        }
+                        mbuf->pkt_len = total_len;
+						mbuf->data_len = total_len;
+                        
+                        uint8_t *msg = rte_pktmbuf_mtod(mbuf, uint8_t *);
+                        ustack_encode_tcp_pkt(msg, total_len);
+                        //rte_eth_tx_burst(global_portid, 0, &mbuf, 1);
+                        
+                        rte_ring_mp_enqueue_burst(ring->out, (void**)&mbuf, 1, NULL);
+
+                        tcp_status = USTACK_TCP_STATUS_SYN_RCVD;
+                    }
+                }
+
+                if (global_flags & RTE_TCP_ACK_FLAG) {
+
+                    if (tcp_status == USTACK_TCP_STATUS_SYN_RCVD) {
+
+                        printf("enter established\n");
+                        tcp_status = USTACK_TCP_STATUS_ESTABLISHED;
+                    }
+
+                }
+                if (global_flags & RTE_TCP_PSH_FLAG) {
+
+                    printf("enter established: %d\n", tcp_status);
+                    if (tcp_status == USTACK_TCP_STATUS_ESTABLISHED) {
+
+						uint8_t hdrlen = (tcphdr->data_off >> 4) * sizeof(uint32_t);
+
+						uint8_t *data = ((uint8_t*)tcphdr + hdrlen);
+
+						printf("tcp data: %s\n", data);
+					}
+
+                }
+            }
+        }
+        // 将 sendto 塞进 sndbuf 里面的数据发送
+        udp_out(mbuf_pool);
+    }
+
+    return 0;
+}
+
+
+
+#define DEFAULT_FD_NUM 3
+
+#define MAX_FD_COUNT 1024
+
+static unsigned char fd_table[MAX_FD_COUNT] = {0};
+
+/**
+ * @brief Allocates a new file descriptor (fd) from the global bitmap.
+ * 
+ * @details 
+ * This function searches the global bitmap (`fd_table`) starting from 
+ * `DEFAULT_FD_NUM` (typically 3, as 0, 1, 2 are reserved for stdin, stdout, 
+ * and stderr). It scans for the first available bit (value 0), marks it as 
+ * occupied (value 1), and returns the corresponding fd. This ensures that 
+ * each socket call gets a unique and valid descriptor.
+ * 
+ * @note The search is bounded by `MAX_FD_COUNT`. If the bitmap is fully 
+ * occupied, it returns -1 to indicate resource exhaustion.
+ * 
+ * @return The allocated fd on success, or -1 if no free fd is available.
+ */
+int get_fd_frombitmap(void) {
+
+    int fd = DEFAULT_FD_NUM;
+    return fd;
+}
+
+/**
+ * @brief Releases an fd back to the bitmap, making it available for reuse.
+ * 
+ * @details 
+ * Clears the corresponding bit in the global `fd_table`. It locates the 
+ * target byte using `fd / 8`, creates a mask for the specific bit using 
+ * `1 << (fd % 8)`, inverts the mask, and applies a bitwise AND to clear it.
+ * 
+ * @param[in] fd The file descriptor to release.
+ * @return 0 on success, -1 if the fd is invalid or out of bounds.
+ */
+int set_fd_frombitmap(int fd) {
+
+
+}
+
+/**
+ * @brief Retrieves the socket control block (TCB/UCB) associated with a given fd.
+ * 
+ * @details 
+ * This function acts as a central dispatcher for the socket layer. Given an fd, 
+ * it searches through the global registries to find the corresponding network 
+ * context, mainly used for POSIX APIs complementation. It supports three types of objects:
+ * 1. UDP/RAW connections stored in the `ustack_udp_sock` linked list.
+ * 2. TCP connections stored in the `tcp_table` (if TCP is enabled).
+ * 3. The epoll instance itself (if the fd belongs to an epoll object).
+ * 
+ * The search is currently implemented as an O(N) linear traversal, which is 
+ * suitable for single-core or low-concurrency scenarios. For high-performance 
+ * industrial stacks, replacing this with a hash table (e.g., `rte_hash`) 
+ * keyed by fd is highly recommended which may be applied later.
+ * 
+ * @param[in] sockfd The file descriptor to look up.
+ * @return void* A pointer to the control block (e.g., `struct ustack_udp_sock *`, 
+ *               `struct ng_tcp_stream *`, or `struct eventpoll *`), or NULL if 
+ *               the fd is not found.
+ */
+void* get_hostinfo_fromfd(int sockfd) {
+    struct ustack_udp_sock *host;
+    for (host = lhost; host != NULL; host = host->next) {
+        if (sockfd == host->fd) {
+            return host;
+        }
+    }
+    return NULL;
+}
+
+/**
+ * @brief 
+ * 
+ * @details This function mainly used between data from NICs and network stack.It will find
+ * a `ustack_udp_sock` object by three demension network demension.In this workflow, there is 
+ * no given file description which only used in application layer  
+ * 
+ * @param[in] ip 
+ */
+struct ustack_udp_sock * get_hostinfo_fromip_port(uint32_t dip, uint16_t port, uint8_t proto) {
+    struct ustack_udp_sock *host;
+    for (host = lhost; host != NULL; host = host->next) {
+        if (dip == host->localip &&port == host->localport && proto == host->protocol) {
+            return host;
+        }
+    }
+    return NULL;
+}
+
+// Poxis API
+int socket(int domain, int type, int protocol) {
+    
+    int fd = get_fd_frombitmap();
+
+    if (type == SOCK_DGRAM) {
+
+        // Only call socket API could create a udp_cock object.
+        struct ustack_udp_sock *host = rte_malloc("UDP tcb", sizeof(struct ustack_udp_sock), 0);
+        if (host == NULL) {
+            return -1;
+        }
+
+        memset(host, 0, sizeof(struct ustack_udp_sock));
+        host->fd = fd;
+
+        host->protocol = IPPROTO_UDP;
+
+        host->rcvbuf = rte_ring_create("receive buffer", RING_SIZE, rte_socket_id(), RING_F_SP_ENQ | RING_F_SC_DEQ);
+        if (host->rcvbuf == NULL) {
+            rte_free(host); // Cautions: remember to free the allocated host.
+            return -1;
+        }
+    
+        host->sndbuf = rte_ring_create("send buffer", RING_SIZE, rte_socket_id(), RING_F_SC_DEQ | RING_F_SP_ENQ);
+        if (host->sndbuf == NULL) {
+
+            rte_ring_free(host->rcvbuf); // Catutions: remember to release allocated memory
+            rte_free(host);
+            return -1;
+        }
+
+        pthread_cond_t blank_cond = PTHREAD_COND_INITIALIZER;
+        rte_memcpy(&host->cond, &blank_cond, sizeof(pthread_cond_t));
+
+        pthread_mutex_t blank_mutex = PTHREAD_MUTEX_INITIALIZER;
+        rte_memcpy(&host->mutex, &blank_mutex, sizeof(pthread_mutex_t));
+
+
+
+        LL_ADD(host, lhost);
+    } else if (type == SOCK_STREAM) {
+        //^^^^^^
+    }
+    return fd;
+}
+
+int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
+    
+    // Find the UDP control block
+    struct ustack_udp_sock *host = get_hostinfo_fromfd(sockfd);
+    if (host == NULL) return -1;
+
+    if (addr == NULL || addrlen < sizeof(struct sockaddr_in)) return -1;
+
+    // Notice that sockaddr_in is designed for IPv4 
+    struct sockaddr_in *localaddr = (struct sockaddr_in*)addr;
+    if (localaddr->sin_family != AF_INET) return -1;
+
+    host->localport = localaddr->sin_port;
+
+    rte_memcpy(&host->localip, localaddr->sin_addr.s_addr, sizeof(uint32_t));
+    rte_memcpy(host->localmac, global_smac, RTE_ETHER_ADDR_LEN);
+
+    return 0;
+}
+
+ ssize_t sendto(int sockfd, const void *buf, size_t len, int flags,
+                      const struct sockaddr *dest_addr, socklen_t addrlen) {
+
+    struct ustack_udp_sock *host = get_hostinfo_fromfd(sockfd);
+    if (host == NULL) return -1;
+
+    const struct sockaddr_in *daddr = (const struct sockaddr_in *)dest_addr;
+    struct ustack_offload *ol = rte_malloc("offload", sizeof(struct ustack_offload));
+
+    if (ol == NULL) return -1;
+
+    ol->dip = daddr->sin_addr.s_addr;
+    ol->dport = daddr->sin_port;
+    ol->sip = host->localip;
+    ol->sport = host->localport;
+    ol->length = len;
+    
+    struct in_addr addr;
+    addr.s_addr = ol->dip;
+    
+
+    ol->data = rte_malloc("unsigned char *", len, 0);
+    if (ol->data == NULL) {
+        rte_free(ol);
+        return -1;
+    }
+
+    rte_memcpy(ol->data, buf, len);
+    
+    if (rte_ring_mp_enqueue(host->sndbuf, ol) != 0){
+        rte_free(ol->data);
+        rte_free(ol);
+    }
+
+    return len;
+
+} 
+
+// TODO: more need to do.
+ssize_t recvfrom(int sockfd, void *buf, size_t len, int flags,
+                        struct sockaddr *src_addr, socklen_t *addrlen) {
+        struct ustack_udp_sock* host = get_hostinfo_fromfd(sockfd);
+        if (host == NULL) return -1;
+         
+        struct ustack_offload *ol = NULL;
+        unsigned char *ptr = NULL;
+
+        int nb = -1;
+
+        pthread_mutex_lock(&host->mutex);
+        // Blocking in the queue
+        while (nb = rte_ring_mc_dequeue(host->rcvbuf, (void **)&ol) < 0) {
+
+            //if (flags & MSG_DONTWAIT || (host->bflags & O_NONBLOCK)) {
+            //pthread_mutex_unlock(&host->mutex);
+            //errno = EAGAIN;
+            //return -1;
+        //}
+
+            pthread_cond_wait(&host->cond, &host->mutex);
+        }
+        pthread_mutex_unlock(&host->mutex);
+
+        struct sockaddr_in *saddr = (struct sockaddr_in*) src_addr;
+        saddr->sin_port = ol->dport;
+        rte_memcpy(&saddr->sin_addr.s_addr, &ol->sip, sizeof(uint32_t));
+
+
+        // TODO: 不太符合 UDP 协议语义，如果 len 小于实际数据大小应该直接截断
+        
+        // 如果 len 小于offload里面实际数据大小，应该做一次截断，将指针向数据后方移动，再一次入队，等待下一次传递数据
+        if (len < ol->length) {
+            rte_memcpy(buf, ol->data, len);
+
+            *ptr = rte_malloc("unsigned char *", ol->length - len, 0);
+            rte_memcpy(ptr, ol->data + len, ol->length - len);
+
+            ol->length -= len;
+            rte_free(ol->data);
+            ol->data = ptr;
+
+            rte_ring_mp_enqueue(host->rcvbuf, ol);
+            
+            return len;
+
+        // 如果 len 大于等于offload里面实际数据大小，就一次拷贝过去。
+        } else {
+            uint16_t copy_len = (len < ol->length) ? len : ol->length;
+
+            rte_memcpy(buf, ol->data, ol->length);
+
+            rte_free(ol->data);
+            rte_free(ol);
+            // 不能直接返回ol-length，注意资源的管理：ol已经被释放了
+            return copy_len;
+        }
+}
+
+/**
+ * @brief Closes a UDP socket and releases all associated resources.
+ * 
+ * @details 
+ * This function terminates the socket connection and cleans up the underlying 
+ * user-space resources. In a DPDK environment (like NitroStack), the operations 
+ * include:
+ * 1. Locating the socket control block (UCB) using the `fd`.
+ * 2. Removing the UCB from the global socket management list to 
+ *    prevent the protocol core from dispatching new packets to it.
+ * 3. Freeing any pending `ustack_offload` structures in the `rcvbuf` and `sndbuf` 
+ *    to prevent memory leaks.
+ * 
+ * @param[in] fd The file descriptor of the socket to be closed.
+ * @return 0 on success, -1 on failure 
+ */
+int close(int fd) {
+    struct ustack_udp_sock *host = get_hostinfo_fromfd(fd);
+    if (host == NULL) return -1;
+
+    LL_REMOVE(host, lhost);
+
+    if (host->rcvbuf) {
+        rte_ring_free(host->rcvbuf);
+    }
+    if (host->sndbuf) {
+        rte_ring_free(host->sndbuf);
+    }
+
+    rte_free(host);
+    return 0;
+}
+ 
+#define UDP_APP_RECV_BUFFER_SIZE 128
+
+/** 
+ * @brief This function is used for an application thread in UDP services.
+ *  
+ * @details 
+ * This function implements a standard UDP Echo server using POSIX Socket APIs. 
+ * It creates a UDP socket, binds it to a certain port on all local interfaces (0.0.0.0), 
+ * and enters an infinite loop to receive data from clients and echo it back.
+ * 
+ * @note This is the baseline implementation using standard Linux kernel networking APIs. 
+ * However, this exact code can be seamlessly migrated to a DPDK user-space stack 
+ * (like NitroStack) via POSIX API hooking (e.g., LD_PRELOAD). 
+ * In the DPDK environment:
+ * 1. `socket()` allocates a `struct ustack_udp_sock` control block instead of a kernel fd.
+ * 2. `bind()` writes the port into the control block's `localport` field.
+ * 3. `recvfrom()` will block on a `pthread_cond_t` and extract data from the `rcvbuf` 
+ *    (rte_ring), completely bypassing the kernel network stack.
+ * 
+ * @param[in] argc The number of arguments.
+ * @param[in] argv The array of arguments.
+ * @return 0 on success, -1 on failure.
+ **/ 
+static int udp_server_entry(int argc, char *argv[]) {
+        int connfd = socket(AF_INET, SOCK_DGRAM, 0);
+        if (connfd == -1) {
+            printf("sockfd failed\n");
+            return -1;
+        }
+
+        struct sockaddr_in localaddr, clientaddr;
+        memset(&localaddr, 0, sizeof(struct sockaddr_in));
+
+        localaddr.sin_port = htons(8889);
+        localaddr.sin_family = AF_INET;
+        localaddr.sin_addr.s_addr = htonl(INADDR_ANY); // 0.0.0.0
+
+        bind(connfd, (struct sockaddr*)&localaddr, sizeof(localaddr));
+        
+        char buffer[UDP_APP_RECV_BUFFER_SIZE] = {0};
+        socklen_t addrlen = sizeof(clientaddr);
+
+        while (1) {
+
+            if (recvfrom(connfd, buffer, UDP_APP_RECV_BUFFER_SIZE, 0,
+            (struct sockaddr*)&clientaddr, &addrlen) < 0) {
+                continue;
+            } else {
+                printf("receive from %s:%d, data:%s\n", inet_ntoa(clientaddr.sin_addr),
+                ntohs(clientaddr.sin_port), buffer);
+                sendto(connfd, buffer, strlen(buffer), 0,
+                (struct sockaddr*)&clientaddr, sizeof(clientaddr));
+            }
+        } 
+        close(connfd);
 }
 
 int main(int argc, char *argv[]) {
@@ -544,18 +1338,60 @@ int main(int argc, char *argv[]) {
     // 在哪个核上，多久执行一次，执行对应的回调函数
     rte_timer_reset(&arp_timer, hz, PERIODICAL, lcore_id, arp_request_timer_cb, mbuf_pool); 
 
+    // Initialize the inout ring buffer used to send and receive data
+    struct inout_ring *ring = ringInstance();
+    if (ring == NULL) {
+        rte_exit(EXIT_FAILURE, "ring buffer init failed\n");
+    } 
 
-    // PMD 主循环：持续轮询网卡 RX 队列并处理收到的报文
+    if (ring->in == NULL) {
+        ring->in = rte_ring_create("in ring", RING_SIZE, rte_socket_id(), RING_F_SP_ENQ | RING_F_SC_DEQ);
+    }
+
+    if (ring->out == NULL) {
+        ring->out = rte_ring_create("out ring", RING_SIZE, rte_socket_id(), RING_F_SP_ENQ | RING_F_SC_DEQ);
+    }
+
+    // Each thread shoule bind to a certain thread.
+    lcore_id = rte_get_next_lcore(lcore_id , 1, 0);
+    // start a thread, pass the task to the logical core
+    rte_eal_remote_launch(pkt_process, mbuf_pool, lcore_id);
+
+    // Get the next thread id and bind the udp process logic to this thread.
+    lcore_id = rte_get_next_lcore(lcore_id, 1, 0);
+    rte_eal_remote_launch(udp_server_entry, mbuf_pool, lcore_id);
+
+    // PMD 主循环：持续轮询网卡 RX 队列并处理收到的报文并做好 TX 队列发送工作
     while (1) {
-        struct rte_mbuf *mbufs[BURST_SIZE] = {0};
+
+        // rx queue: receive data from NICs, and put into in ring
+        struct rte_mbuf *rx[BURST_SIZE];
 
         // 从 RX 环形队列批量收包，num_recvd 为本次实际收到的报文数
-        uint16_t num_recvd = rte_eth_rx_burst(global_portid, 0, mbufs, BURST_SIZE);
+        uint16_t num_recvd = rte_eth_rx_burst(global_portid, 0, rx, BURST_SIZE);
 
         if (num_recvd > BURST_SIZE) {
             rte_exit(EXIT_FAILURE, "Error receive from eth\n");
+        } else if (num_recvd > 0) {
+            uint16_t nb_enq = rte_ring_sp_enqueue_burst(ring->in, (void**) rx, num_recvd, NULL);
+            // free those did not enqueue package
+            for (uint16_t k = nb_enq; k < num_recvd; k++) {
+                rte_pktmbuf_free(rx[k]);
+            }
+        }
+        
+        // tx queue: send data to NICs from the out ring
+        struct rte_mbuf *tx[BURST_SIZE];
+        unsigned nb_deq = rte_ring_sc_dequeue_burst(ring->out, (void**)tx, BURST_SIZE, NULL);
+        if (nb_deq > 0) {
+            uint16_t nb_tx = rte_eth_tx_burst(global_portid, 0, tx, nb_deq);
+            for (unsigned k = nb_tx;k < nb_deq;k++) {
+                rte_pktmbuf_free(tx[k]);
+            }
         }
 
+        //做解耦工作， 这个主循环只做 rx tx的 IO 工作，其他的迁移
+        #if 0
         int i = 0;
         for (; i < num_recvd; i++) {
             struct rte_ether_hdr *ethhdr = rte_pktmbuf_mtod(mbufs[i], struct rte_ether_hdr*);
@@ -784,7 +1620,8 @@ int main(int argc, char *argv[]) {
                 rte_pktmbuf_free(mbufs[i]);
         }
 
-        // 定时器
+#endif
+        // 定时器 keep until
         static uint64_t prev_tsc = 0, cur_tsc;
         uint64_t diff_tsc;
         
