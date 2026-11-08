@@ -41,9 +41,16 @@
 #include "arp.h"
 #include "fd.h"
 #include "posix_api.h"
+// #include "hash.h"
 
 struct rte_mbuf* ustack_send_udp(struct rte_mempool *mbuf_pool, unsigned char *data, uint16_t length);
+int udp_out(struct rte_mempool *mbuf_pool);
+int tcp_out (struct rte_mempool* mbuf_pool);
 
+// TODO: 后续引入多网卡时，需要将 gDpdkPortId 替换为动态参数。
+// 1. 收包时使用 mbuf->port 获取来源。
+// 2. UCB/TCB 中需保存网卡 port_id。
+// 3. 发包函数需显式传入 port_id。
 int gDpdkPortId = 0;
 
 int global_portid = 0;   /* 使用的端口号（对应第一个可用的 ethdev） */
@@ -58,6 +65,12 @@ int global_portid = 0;   /* 使用的端口号（对应第一个可用的 ethdev
 #define TCP_INIT_WINDOWS 14600
 #define TIMER_RESOLUTION_CYCLES 20000000ULL
 
+#define TCP_OPTION_LENGTH 8
+
+#define TCP_MAX_SEQ 0xFFFFFFFF
+
+//TODO:后续采用 RFC 6928 规定的 min(10*MSS, max(2*MSS, 14600))来动态计算窗口
+#define TCP_INITIAL_WINDOW  14600 // RFC 6928
 static uint8_t gDefaultArpMac[RTE_ETHER_ADDR_LEN] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
 
 #if ENABLE_SEND
@@ -66,6 +79,8 @@ static uint8_t gDefaultArpMac[RTE_ETHER_ADDR_LEN] = {0xff, 0xff, 0xff, 0xff, 0xf
 
 static uint32_t gLocalIp = MAKE_IPV4_ADDR(192, 168, 139, 137); // 192168139137
 
+//TODO:对于全局唯一的源 MAC、IP 地址需要引入 DPDK 动态查询网卡 MAC、IP 地址
+// 后续可以考虑引入多张网卡来实现数据收发
 uint8_t global_smac[RTE_ETHER_ADDR_LEN]; // global default source mac address
 uint8_t global_dmac[RTE_ETHER_ADDR_LEN];
 
@@ -120,7 +135,137 @@ typedef enum __USTACK_TCP_STATUS {
 	
 } USTACK_TCP_STATUS;
 
-uint8_t tcp_status = USTACK_TCP_STATUS_LISTEN;
+
+/**
+ * @brief TCP connection control block (TCB).
+ *
+ * @details
+ * One instance is allocated per TCP connection and linked into the global
+ * connection table, so that an incoming segment can be dispatched to the
+ * connection that owns it by looking up the 5-tuple (sip, sport, dip, dport,
+ * protocol). It plays the same role as `struct sock` / `struct tcp_sock` in
+ * the Linux kernel, or `struct ng_tcp_stream` in the reference implementation.
+ *
+ * The two rings decouple the application lcore from the protocol lcore:
+ *   - `sndbuf` carries the descriptors produced by the application (or by the
+ *     state machine itself, e.g. SYN/ACK, ACK, FIN) towards the output path,
+ *     where they are turned into real TCP segments.
+ *   - `rcvbuf` carries the payload extracted from the received segments
+ *     towards the application.
+ *
+ * @note Addresses and ports are stored in network byte order, while
+ *       `snd_nxt` / `recv_nxt` are kept in host byte order and are only
+ *       converted with htonl() when a segment is built.
+ */
+struct ustack_tcp_stream {
+    //TODO: 做拥塞控制流量控制字段、可靠传输、小包确认与恢复字段
+    int fd;                                 /**< socket descriptor exposed to the application, -1 until the connection is accepted */
+
+    uint32_t dip;                           /**< remote (peer) IPv4 address, network byte order */
+    uint8_t localmac[RTE_ETHER_ADDR_LEN];   /**< local MAC address, used as the Ethernet source of every outgoing segment */
+    uint16_t dport;                        /**< remote (peer) TCP port, network byte order */
+
+    uint8_t protocol;                       /**< transport protocol, always IPPROTO_TCP in this implementation */
+
+    uint16_t sport;                         /**< local TCP port, network byte order */
+    uint32_t sip;                           /**< local IPv4 address, network byte order */
+
+    uint32_t snd_nxt;                       /**< next sequence number to send (RFC 793 SND.NXT), host byte order */
+    uint32_t rcv_nxt;                      /**< next sequence number expected from the peer (RFC 793 RCV.NXT), host byte order */
+
+    struct rte_ring *sndbuf;                /**< outgoing queue holding the descriptors waiting to be serialised and transmitted */
+    struct rte_ring *rcvbuf;                /**< incoming queue holding the payload waiting to be read by the application */
+
+    pthread_cond_t cond;                    /**< wakes a blocked application thread when data or a new connection arrives */
+    pthread_mutex_t mutex;                  /**< paired with @ref cond to guard the wait/signal sequence */
+
+    USTACK_TCP_STATUS status;
+
+    struct ustack_tcp_stream *prev;
+    struct ustack_tcp_stream *next;
+};
+
+//TODO: 现在由链表管理全局的 udp_sock 后续可以引入 rb_tree 使用全局的 rbtree来管理全部的tcp/udp连接控制块
+struct ustack_tcp_table {
+
+    int count;
+    struct ustack_tcp_stream *tcb_set; //
+
+};
+
+/**
+ * @brief TCP segment descriptor: the bridge between the control plane and the data plane.
+ *
+ * @details
+ * This structure is NOT a TCP segment and must not be confused with
+ * `struct rte_tcp_hdr`, which is the on-wire header layout. It is a purely local
+ * descriptor that carries "what should be sent" (or "what has been received")
+ * between the control plane and the data plane, so that the application side and
+ * the packet-serialising side never have to share global state.
+ *
+ * A descriptor travels in two directions through the per-connection rings:
+ *   - TX path: the application (or the state machine itself, for SYN/ACK, ACK and
+ *     FIN) allocates a descriptor, fills it in and enqueues it into
+ *     `ustack_tcp_stream::sndbuf`. tcp_out() dequeues it and hands it to
+ *     ustack_encode_tcp_pkt(), which serialises it into a real segment and
+ *     enqueues the resulting mbuf into `inout_ring::out`.
+ *   - RX path: the protocol lcore strips the payload out of a received segment,
+ *     stores it in a descriptor and enqueues it into `ustack_tcp_stream::rcvbuf`;
+ *     the application thread blocked in recv() is woken up through the
+ *     connection's condition variable and copies the bytes out.
+ *
+ * The fields fall into three groups, and the difference matters:
+ *   1. on-wire header fields copied verbatim into `struct rte_tcp_hdr`:
+ *      sport, dport, seqnum, acknum, hdrlen_off, tcp_flags, win_len, cksum, tcp_urp;
+ *   2. on-wire option bytes: options[] holds the option area as raw bytes and is
+ *      copied behind the fixed 20-byte header only when optlen > 0;
+ *   3. local-only control fields: optlen, data and length. None of them exists on
+ *      the wire - the peer recovers the option length from the data offset
+ *      instead, as ((data_off >> 4) - 5) * 4.
+ *
+ * @note
+ *  - All header fields are kept in HOST byte order here. The conversion with
+ *    htonl()/htons() happens only while a segment is being built.
+ *  - hdrlen_off stores the raw value of the TCP data offset field, not a byte
+ *    count: 0x50 means 5 32-bit words, i.e. a 20-byte header without options.
+ *  - optlen and hdrlen_off describe the same thing and must stay consistent,
+ *    that is hdrlen_off = (5 + optlen) << 4. If they disagree the peer will
+ *    interpret the option area as payload and every byte after it is shifted.
+ *  - Ownership of data follows the descriptor: once the descriptor is enqueued,
+ *    the dequeuing side must free both the payload buffer and the descriptor
+ *    itself, otherwise memory leaks.
+ */
+struct tcp_fragment {
+
+    uint16_t sport;  /**< TCP source port. */
+	uint16_t dport;  /**< TCP destination port. */
+	uint32_t seqnum;  /**< TX data sequence number. */
+	uint32_t acknum;  /**< RX data acknowledgement sequence number. */
+	uint8_t  hdrlen_off;  /**< Data offset. */
+	uint8_t  tcp_flags; /**< TCP flags */
+	uint16_t win_len;    /**< RX flow control window. */
+	uint16_t cksum;     /**< TCP checksum. */
+	uint16_t tcp_urp;   /**< TCP urgent pointer, if any. */
+
+    int optlen; /**<The length of options area per 4 bytes> */
+    uint32_t options[TCP_OPTION_LENGTH];
+    unsigned char* data;
+    int length;
+};
+
+
+
+struct ustack_tcp_table *tInst = NULL;
+
+static struct ustack_tcp_table *tcpInstance(void) {
+
+    if (tInst == NULL) {
+        tInst = rte_malloc("ustack_tcp_table", sizeof(struct ustack_tcp_table), 0);
+        memset(tInst, 0, sizeof(struct ustack_tcp_table));
+    }
+    
+    return tInst;
+}
 
 uint8_t global_flags;
 uint32_t global_seqnum;
@@ -259,8 +404,8 @@ static int ustack_encode_udp_pkt (uint8_t *msg, uint32_t sip, uint32_t dip,
 }
 
 // Get a mbuf from the memory pool, and fill the UDP fields.return the mbuf.
-static struct ret_mbuf *ustack_udp_pkt (struct rte_mempool *mbuf_pool, uint32_t sip, uint32_t dip, uint16_t sport, uint16_t dport, 
-            const uint8_t *srcmac, const uint8_t *dstmac, const uint8_t *data, uint16_t length) {
+static struct rte_mbuf *ustack_udp_pkt (struct rte_mempool *mbuf_pool, uint32_t sip, uint32_t dip, uint16_t sport, uint16_t dport, 
+            const uint8_t *srcmac, uint8_t *dstmac, uint8_t *data, uint16_t length) {
 
     const uint16_t total_len = sizeof(struct rte_ether_hdr) + sizeof(struct rte_ipv4_hdr) + 
                                 sizeof(struct rte_udp_hdr) + length;
@@ -279,45 +424,92 @@ static struct ret_mbuf *ustack_udp_pkt (struct rte_mempool *mbuf_pool, uint32_t 
 }
 
 // construct TCP msg
-static int ustack_encode_tcp_pkt(uint8_t *msg, uint16_t total_len) {
+static int ustack_encode_tcp_pkt(uint8_t *msg, uint32_t sip, uint32_t dip, 
+    uint8_t *srcmac, uint8_t * dstmac, struct tcp_fragment *fragment) {
     
+    const unsigned total_len = fragment->length + sizeof(struct rte_ether_hdr) +
+        sizeof(struct rte_ipv4_hdr) + sizeof(struct rte_tcp_hdr) + fragment->optlen * sizeof(uint32_t);
+
     // ether header
     struct rte_ether_hdr *eth = (struct rte_ether_hdr *)msg;
-    rte_memcpy(eth->d_addr.addr_bytes, global_dmac, RTE_ETHER_ADDR_LEN);
-    rte_memcpy(eth->s_addr.addr_bytes, global_smac, RTE_ETHER_ADDR_LEN);
+    rte_memcpy(eth->d_addr.addr_bytes, dstmac, RTE_ETHER_ADDR_LEN);
+    rte_memcpy(eth->s_addr.addr_bytes, srcmac, RTE_ETHER_ADDR_LEN);
     eth->ether_type = htons(RTE_ETHER_TYPE_IPV4);
-
+    
     // ip header
+    // TODO[FIXME]:如果以太网头携带 Vlan 标志的话就需要动态计算 ip 头部指针偏移
+    uint8_t hdr_words = fragment->hdrlen_off >> 4;
+    uint16_t opt_bytes = (hdr_words > 5) ? (hdr_words - 5) : 0;
+
     struct rte_ipv4_hdr *ip = (struct rte_ipv4_hdr*)(eth + 1); //msg + 
-    ip->version_ihl = 0x45;
+    ip->version_ihl = 0x45;  // RTE_IPV4_VHL_DEF
     ip->type_of_service = 0;
     ip->total_length = htons(total_len - sizeof(struct rte_ether_hdr));
     ip->packet_id = 0;
     ip->fragment_offset = 0;
-    ip->time_to_live = 64;
+    ip->time_to_live = 64; // TTL = 64
     ip->next_proto_id = IPPROTO_TCP;
-    ip->src_addr = global_sip;
-    ip->dst_addr = global_dip;
+    ip->src_addr = sip;
+    ip->dst_addr = dip; // global variable tcp_sock fileds:from dingle connection to multi-connections
     
     // The checksum field must be set to 0 by the caller before caculate the checksum.
     ip->hdr_checksum = 0;
     ip->hdr_checksum = rte_ipv4_cksum(ip);
 
     // tcp header
-    struct rte_tcp_hdr *tcp = (struct rte_tcp_hdr*)(ip + 1);
-    tcp->src_port = global_sport;
-    tcp->dst_port = global_dport;
-    tcp->sent_seq = htonl(12345); // 硬编码确定本端选定的初始序列号 ISN， 12346 为第一个数据字节序
-    tcp->recv_ack = htonl(global_seqnum + 1);
-    tcp->data_off = ((sizeof(struct rte_tcp_hdr) / 4) << 4); // = 0x50，高四位位tcp头部大小 中三位保留 最后一位为 NS（也可以被当做保留位）
-    tcp->tcp_flags = RTE_TCP_SYN_FLAG | RTE_TCP_ACK_FLAG;
+    uint8_t iphdr_len = (ip->version_ihl & 0x0f) * 4;
+    struct rte_tcp_hdr *tcp = (struct rte_tcp_hdr*)((uint8_t*)ip + iphdr_len);
+    tcp->src_port = fragment->sport;
+    tcp->dst_port = fragment->dport;
+    tcp->sent_seq = htonl(fragment->seqnum);
+    tcp->recv_ack = htonl(fragment->acknum);
+    
+    // hdrlen_off 高四位为 header_length 字段，低四位为 reserved bits(must be 0)
+    // 曾经中三位保留 最后一位为 NS（也可以被当做保留位），后来由 RFC 8311 废除
+    tcp->data_off = fragment->hdrlen_off;
+    tcp->tcp_flags = fragment->tcp_flags;
+    tcp->rx_win = htons(fragment->win_len);
+    tcp->tcp_urp = fragment->tcp_urp;
+    
+    // TCP options
+    uint8_t* payload = (uint8_t*)(tcp + 1);
+    if (opt_bytes > 0) {
+        rte_memcpy(payload, fragment->options, opt_bytes);
+    }
 
-    tcp->rx_win = TCP_INIT_WINDOWS; //htons(4096);  // rmem
+    payload += opt_bytes;
+    if (fragment->data != NULL && fragment->length > 0) {
+        rte_memcpy(payload, fragment->data, fragment->length);
+    }
+
+
 	tcp->cksum = 0;
 	tcp->cksum = rte_ipv4_udptcp_cksum(ip, tcp);
 
     return 0;
 }
+
+static struct rte_mbuf *ustack_tcp_pkt(struct rte_mempool* mbuf_pool,
+    uint32_t sip, uint32_t dip, uint8_t *srcmac, uint8_t *dstmac, struct tcp_fragment *fragment) {
+
+        uint8_t hdr_words = fragment->hdrlen_off >> 4;
+        uint8_t opt_bytes = (hdr_words > 5) ? (hdr_words - 5) : 0;
+        const unsigned total_len = sizeof(struct rte_ether_hdr) + sizeof(struct rte_ipv4_hdr)
+            + sizeof(struct rte_tcp_hdr) + opt_bytes + fragment->length;
+
+        struct rte_mbuf *mbuf = rte_pktmbuf_alloc(mbuf_pool);
+        if (mbuf == NULL) return NULL;
+
+        mbuf->pkt_len = total_len;
+        mbuf->data_len = total_len;
+
+        // pointer to the type of uint8_t*.
+        uint8_t *pkt = rte_pktmbuf_mtod(mbuf, uint8_t *);
+        ustack_encode_tcp_pkt(pkt, sip, dip, srcmac, dstmac, fragment);
+
+        return mbuf;
+}   
+
 
 /** 
  * @brief This function is used to construct an ARP packet.
@@ -600,6 +792,7 @@ struct ustack_udp_sock { // tcp.c : localhost Linux : struct udp_sock (UDP tcb)
     pthread_mutex_t mutex;
 };
 
+// TODO: 需要像 TCP 协议一样建立一个全局的 table 来管理头指针以及 UDP 连接个数 
 // Global singleton list head  
 static struct ustack_udp_sock *lhost = NULL;
 
@@ -695,6 +888,7 @@ static int udp_process(struct rte_mbuf *udpmbuf) {
 }
 
 int udp_out(struct rte_mempool *mbuf_pool) {
+
     struct ustack_udp_sock* host;
     for (host = lhost; host != NULL; host = host->next) {
         
@@ -808,7 +1002,7 @@ static int pkt_process(__attribute__((unused)) void *arg) {
                         //if (arp_mbuf && rte_eth_tx_burst(global_portid, 0, &arp_mbuf, 1) != 1)
                         //    rte_pktmbuf_free(arp_mbuf);
 
-                            if (rte_ring_mp_enqueue_burst(ring->out, (void**)&arp_mbuf, 1, NULL) != NULL) {
+                            if (rte_ring_mp_enqueue_burst(ring->out, (void**)&arp_mbuf, 1, NULL) != 1) {
                                 rte_pktmbuf_free(arp_mbuf);
                             }
 
@@ -878,83 +1072,22 @@ static int pkt_process(__attribute__((unused)) void *arg) {
 
             // 处理 UDP 报文（此处假设 IP 头无 options，长度固定 20 字节）
             if(iphdr->next_proto_id == IPPROTO_UDP) {
-              
+                
+                printf("udp_proceas\n");
                 udp_process(mbufs[i]);
 
                 // 处理 TCP 报文
             } else if (iphdr->next_proto_id == IPPROTO_TCP) {
-                struct rte_tcp_hdr *tcphdr = (struct rte_tcp_hdr *)(iphdr + 1);
 
-                rte_memcpy(global_smac, ethhdr->d_addr.addr_bytes, RTE_ETHER_ADDR_LEN);
-				rte_memcpy(global_dmac, ethhdr->s_addr.addr_bytes, RTE_ETHER_ADDR_LEN);
-
-				rte_memcpy(&global_sip, &iphdr->dst_addr, sizeof(uint32_t));
-				rte_memcpy(&global_dip, &iphdr->src_addr, sizeof(uint32_t));
-
-				rte_memcpy(&global_sport, &tcphdr->dst_port, sizeof(uint16_t));
-				rte_memcpy(&global_dport, &tcphdr->src_port, sizeof(uint16_t));
-
-                global_flags = tcphdr->tcp_flags;
-                global_seqnum = ntohl(tcphdr->sent_seq);
-                global_seqnum = ntohl(tcphdr->recv_ack);
-
-                struct in_addr addr;
-                addr.s_addr = iphdr->src_addr;
-                printf("TCP packet source IP %s:%d", inet_ntoa(addr), ntohs(tcphdr->src_port));
-
-                addr.s_addr = iphdr->dst_addr;
-                printf("Destinate IP %s:%d, flags: %x, seqnum: %d, acknum: %d\n",
-                    inet_ntoa(addr), ntohs(tcphdr->src_port), global_flags, global_seqnum, global_acknum);
-
-                if (global_flags & RTE_TCP_SYN_FLAG) {
-
-                    if (tcp_status == USTACK_TCP_STATUS_LISTEN) {
-                        uint16_t total_len = sizeof(struct rte_tcp_hdr) + sizeof(struct rte_ipv4_hdr) + sizeof(struct rte_ether_hdr);
-
-                        // lock-free malloc from rte_mempool
-                        struct rte_mbuf *mbuf = rte_pktmbuf_alloc(mbuf_pool);
-                        if (!mbuf) {
-                            rte_exit(EXIT_FAILURE, "Error rte_pktmbnuf_malloc\n");
-                        }
-                        mbuf->pkt_len = total_len;
-						mbuf->data_len = total_len;
-                        
-                        uint8_t *msg = rte_pktmbuf_mtod(mbuf, uint8_t *);
-                        ustack_encode_tcp_pkt(msg, total_len);
-                        //rte_eth_tx_burst(global_portid, 0, &mbuf, 1);
-                        
-                        rte_ring_mp_enqueue_burst(ring->out, (void**)&mbuf, 1, NULL);
-
-                        tcp_status = USTACK_TCP_STATUS_SYN_RCVD;
-                    }
-                }
-
-                if (global_flags & RTE_TCP_ACK_FLAG) {
-
-                    if (tcp_status == USTACK_TCP_STATUS_SYN_RCVD) {
-
-                        printf("enter established\n");
-                        tcp_status = USTACK_TCP_STATUS_ESTABLISHED;
-                    }
-
-                }
-                if (global_flags & RTE_TCP_PSH_FLAG) {
-
-                    printf("enter established: %d\n", tcp_status);
-                    if (tcp_status == USTACK_TCP_STATUS_ESTABLISHED) {
-
-						uint8_t hdrlen = (tcphdr->data_off >> 4) * sizeof(uint32_t);
-
-						uint8_t *data = ((uint8_t*)tcphdr + hdrlen);
-
-						printf("tcp data: %s\n", data);
-					}
-
-                }
+                printf("ustack_tcp_process\n");
+                ustack_tcp_process(mbufs[i]);
+            
             }
         }
-        // 将 sendto 塞进 sndbuf 里面的数据发送
+        // 应用层调用 sendto 时将数据塞进 sndbuf 里面的数据发送
         udp_out(mbuf_pool);
+
+        tcp_out(mbuf_pool);
     }
 
     return 0;
@@ -966,7 +1099,7 @@ static int pkt_process(__attribute__((unused)) void *arg) {
 
 #define MAX_FD_COUNT 1024
 
-static unsigned char fd_table[MAX_FD_COUNT] = {0};
+static unsigned char fd_table[MAX_FD_COUNT] __attribute__((unused)) = {0};
 
 /**
  * @brief Allocates a new file descriptor (fd) from the global bitmap.
@@ -1000,8 +1133,7 @@ int get_fd_frombitmap(void) {
  * @param[in] fd The file descriptor to release.
  * @return 0 on success, -1 if the fd is invalid or out of bounds.
  */
-int set_fd_frombitmap(int fd) {
-
+int set_fd_frombitmap(__rte_unused int fd) {
 
 }
 
@@ -1055,8 +1187,10 @@ struct ustack_udp_sock * get_hostinfo_fromip_port(uint32_t dip, uint16_t port, u
     return NULL;
 }
 
+//TODO:后续需要解决和系统 glibc 链接提供的同名API出现的符号劫持问题
+// 重点是需要利用 fd 来区分何时调用系统 API， 何时采用本协议栈为应用层提供的 API
 // Poxis API
-int socket(int domain, int type, int protocol) {
+int socket(__rte_unused int domain, int type,__rte_unused int protocol) {
     
     int fd = get_fd_frombitmap();
 
@@ -1116,7 +1250,7 @@ int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
 
     host->localport = localaddr->sin_port;
 
-    rte_memcpy(&host->localip, localaddr->sin_addr.s_addr, sizeof(uint32_t));
+    rte_memcpy(&host->localip, &localaddr->sin_addr.s_addr, sizeof(uint32_t));
     rte_memcpy(host->localmac, global_smac, RTE_ETHER_ADDR_LEN);
 
     return 0;
@@ -1129,7 +1263,7 @@ int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
     if (host == NULL) return -1;
 
     const struct sockaddr_in *daddr = (const struct sockaddr_in *)dest_addr;
-    struct ustack_offload *ol = rte_malloc("offload", sizeof(struct ustack_offload));
+    struct ustack_offload *ol = rte_malloc("offload", sizeof(struct ustack_offload), 0);
 
     if (ol == NULL) return -1;
 
@@ -1141,7 +1275,7 @@ int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
     
     struct in_addr addr;
     addr.s_addr = ol->dip;
-    
+    RTE_LOG(INFO, USER1, "sendto dst ip: %s, dst port: %d\n", inet_ntoa(addr), ntohs(ol->dport));
 
     ol->data = rte_malloc("unsigned char *", len, 0);
     if (ol->data == NULL) {
@@ -1161,8 +1295,8 @@ int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
 } 
 
 // TODO: more need to do.
-ssize_t recvfrom(int sockfd, void *buf, size_t len, int flags,
-                        struct sockaddr *src_addr, socklen_t *addrlen) {
+ssize_t recvfrom(int sockfd, void *buf, size_t len, __rte_unused int flags,
+                        struct sockaddr *src_addr, __rte_unused socklen_t *addrlen) {
         struct ustack_udp_sock* host = get_hostinfo_fromfd(sockfd);
         if (host == NULL) return -1;
          
@@ -1173,7 +1307,7 @@ ssize_t recvfrom(int sockfd, void *buf, size_t len, int flags,
 
         pthread_mutex_lock(&host->mutex);
         // Blocking in the queue
-        while (nb = rte_ring_mc_dequeue(host->rcvbuf, (void **)&ol) < 0) {
+        while ((nb = rte_ring_mc_dequeue(host->rcvbuf, (void **)&ol)) < 0) {
 
             //if (flags & MSG_DONTWAIT || (host->bflags & O_NONBLOCK)) {
             //pthread_mutex_unlock(&host->mutex);
@@ -1186,7 +1320,7 @@ ssize_t recvfrom(int sockfd, void *buf, size_t len, int flags,
         pthread_mutex_unlock(&host->mutex);
 
         struct sockaddr_in *saddr = (struct sockaddr_in*) src_addr;
-        saddr->sin_port = ol->dport;
+        saddr->sin_port = ol->sport;
         rte_memcpy(&saddr->sin_addr.s_addr, &ol->sip, sizeof(uint32_t));
 
 
@@ -1196,7 +1330,7 @@ ssize_t recvfrom(int sockfd, void *buf, size_t len, int flags,
         if (len < ol->length) {
             rte_memcpy(buf, ol->data, len);
 
-            *ptr = rte_malloc("unsigned char *", ol->length - len, 0);
+            ptr = rte_malloc("unsigned char *", ol->length - len, 0);
             rte_memcpy(ptr, ol->data + len, ol->length - len);
 
             ol->length -= len;
@@ -1240,6 +1374,13 @@ int close(int fd) {
     struct ustack_udp_sock *host = get_hostinfo_fromfd(fd);
     if (host == NULL) return -1;
 
+    // TODO: 解决与 Linux 系统的 glibc 产生的符号劫持问题
+    /*
+    if (host == NULL) {        // 不是我的 socket，交给真正的 libc close 
+        extern int __close(int);   
+        return __close(fd);
+    */
+
     LL_REMOVE(host, lhost);
 
     if (host->rcvbuf) {
@@ -1272,11 +1413,10 @@ int close(int fd) {
  * 3. `recvfrom()` will block on a `pthread_cond_t` and extract data from the `rcvbuf` 
  *    (rte_ring), completely bypassing the kernel network stack.
  * 
- * @param[in] argc The number of arguments.
- * @param[in] argv The array of arguments.
+ * @param[in] arg The number of arguments pointer.
  * @return 0 on success, -1 on failure.
  **/ 
-static int udp_server_entry(int argc, char *argv[]) {
+static int udp_server_entry(__rte_unused void *arg) {
         int connfd = socket(AF_INET, SOCK_DGRAM, 0);
         if (connfd == -1) {
             printf("sockfd failed\n");
@@ -1307,7 +1447,457 @@ static int udp_server_entry(int argc, char *argv[]) {
                 (struct sockaddr*)&clientaddr, sizeof(clientaddr));
             }
         } 
+
         close(connfd);
+}
+
+/**
+ * @brief 根据四元组或端口搜索对应的 TCP 控制块（TCB）
+ * 
+ * 在 DPDK 用户态协议栈中，网卡收到的每一个包都需要通过这个函数
+ * 找到它所属的 TCP 连接（TCB），从而进行后续的状态机处理。
+ * 
+ * @param sip  local ip
+ * @param dip  destinate IP address 
+ * @param sport local port 
+ * @param dport destinate port
+ * @return struct ustack_tcp_stream* 
+ *         - 找到匹配的连接：返回指向该 TCB 的指针
+ *         - 没找到：返回 NULL
+ */
+static struct ustack_tcp_stream* ustack_tcp_stream_search (uint32_t sip, uint32_t dip, uint16_t sport, uint16_t dport) {
+
+    struct ustack_tcp_table *table = tcpInstance();
+
+    struct ustack_tcp_stream *iter;
+    
+    // 四元组匹配已经建立的连接 --> 直接返回相应的建立连接块
+    for (iter = table->tcb_set; iter != NULL; iter = iter->next) { // search established
+
+        if (iter->sip == sip && iter->dip == dip &&
+            iter->sport == sport && iter->dport == dport) {
+                return iter;
+            }
+    }
+
+    // 如果没有连接，则查看是否有监听在外来包目的端口的监听控制块-->应用层的监听 sokcet
+    for (iter = table->tcb_set; iter != NULL; iter =iter->next) {
+
+        if (iter->sport == dport && iter->status == USTACK_TCP_STATUS_LISTEN) {
+            return iter;
+        }
+    }
+
+    return NULL;
+}
+
+static struct ustack_tcp_stream *ustack_tcp_stream_create(uint32_t sip, uint32_t dip, uint16_t sport, uint16_t dport) {
+
+    struct ustack_tcp_stream *stream = rte_malloc("ustack_tcp_stream", sizeof(struct ustack_tcp_stream), 0);
+    if (stream == NULL) return NULL;
+    
+    stream->sip = sip;
+    stream->dip = dip;
+    stream->sport = sport;
+    stream->dport = dport;
+    stream->protocol = IPPROTO_TCP;
+    stream->fd = -1; //unused fd value
+
+    stream->status = USTACK_TCP_STATUS_LISTEN;
+
+    printf("ustack_tcp_stream_create\n");
+
+    stream->sndbuf = rte_ring_create("sndbuf", RING_SIZE, rte_socket_id, 0);
+    stream->rcvbuf = rte_ring_create("rcvbuf", RING_SIZE, rte_socket_id, 0);
+
+    // TODO [FIXME]: 生产环境需替换为更安全的 ISN 生成算法，防止 TCP 伪造攻击。
+    // uint64_t now_us = rte_get_timer_cycles() / (rte_get_timer_hz()/ 1000000ULL);
+    // stream->snd_nxt = ustack_tcp_isn(sip, sport, dip, dport,gIsqSecret, now_us);
+    // 其中 gIsqSecret 是全局秘钥，仅启动时生成一次且必须保密
+
+    uint32_t next_seed = time(NULL);
+    stream->snd_nxt = rand_r(&next_seed) % TCP_MAX_SEQ;
+    rte_memcpy(stream->localmac, global_smac, RTE_ETHER_ADDR_LEN);
+
+    pthread_cond_t blank_cond = PTHREAD_COND_INITIALIZER;
+    rte_memcpy(&stream->cond, &blank_cond, sizeof(pthread_cond_t));
+
+    pthread_mutex_t blank_mutex = PTHREAD_MUTEX_INITIALIZER;
+    rte_memcpy(&stream->mutex, &blank_mutex, sizeof(pthread_mutex_t));
+    
+    struct ustack_tcp_table* table = tcpInstance();
+    LL_ADD(stream, table->tcb_set);
+
+    return stream;
+}
+
+/**
+ * @brief Handle a segment that arrives on a connection in LISTEN state.
+ *
+ * @details
+ * This is the server side entry of the three-way handshake, i.e. the
+ * LISTEN -> SYN_RCVD transition of RFC 793:
+ *
+ *   LISTEN -- recv SYN --> SYN_RCVD
+ *
+ * A listening TCB carries no peer information yet (fd is not owned by the
+ * application, dip/dport are not meaningful, always filling them with zero), 
+ * so a SYN must NOT change the state of the listener itself - the listener 
+ * has to stay in LISTEN to keep accepting other peers. Instead, the expected 
+ * sequence of actions is:
+ *
+ *   1. create a NEW TCB for the 5-tuple of this SYN,
+ *   2. record the peer ISN + 1 into the new TCB's recv_nxt (RCV.NXT),
+ *   3. queue a SYN/ACK carrying the local ISN into the new TCB's sndbuf so
+ *      that tcp_out() can serialise it later,
+ *   4. set the new TCB status to SYN_RCVD and wait for the final ACK.
+ *
+ * @note A retransmitted SYN must be answered with the same SYN/ACK again, so
+ *       nothing here may depend on the SYN arriving exactly once.
+ *
+ * @param[in,out] stream the TCB on which the segment was matched; on entry it
+ *                       is the listening TCB of the local port
+ * @param[in]     tcphdr the parsed TCP header of the received segment, already
+ *                       bounds checked by the caller
+ * @param[in]     iphdr  the parsed IPv4 header of the received segment, used to
+ *                       obtain the peer address
+ * @return 0 on success, -1 when a TCB or a fragment could not be allocated
+ */
+static int ustack_tcp_handle_listen (struct ustack_tcp_stream* stream, struct rte_tcp_hdr *tcphdr, struct rte_ipv4_hdr *iphdr) {
+    
+    if (tcphdr->tcp_flags & RTE_TCP_SYN_FLAG) {
+        
+        if (stream->status == USTACK_TCP_STATUS_LISTEN) {
+            
+            struct tcp_fragment *fragment = rte_malloc("ustack_tcp_fragment",sizeof(struct tcp_fragment), 0);
+            struct ustack_tcp_stream *syn = ustack_tcp_stream_create(iphdr->dst_addr, iphdr->src_addr, tcphdr->dst_port, tcphdr->src_port);
+            if (fragment == NULL) return -1;
+            memset(fragment, 0, sizeof(struct tcp_fragment));
+
+            fragment->sport = tcphdr->dst_port;
+            fragment->dport = tcphdr->src_port;
+
+            fragment->seqnum = syn->snd_nxt;
+            fragment->acknum = ntohs(tcphdr->sent_seq) + 1;
+            syn->rcv_nxt = fragment->acknum;
+            
+            fragment->tcp_flags = (RTE_TCP_SYN_FLAG | RTE_TCP_ACK_FLAG);
+            fragment->win_len = TCP_INITIAL_WINDOW;
+            fragment->hdrlen_off = 0x50;
+            
+            fragment->data = NULL;
+            fragment->length = 0;
+
+            rte_ring_mp_enqueue(syn->sndbuf, fragment);
+
+            syn->status = USTACK_TCP_STATUS_SYN_RCVD;
+        }
+    
+    }
+    return 0;
+
+}
+
+/**
+ * @brief Handle a segment that arrives on a connection in SYN_RCVD state.
+ *
+ * @details
+ * SYN_RCVD is the second state of the server side three-way handshake. A TCB
+ * enters this state right after it has answered a SYN with a SYN/ACK, so the
+ * only segment that may complete the handshake here is the third one:
+ *
+ *   SYN_RCVD -- recv ACK --> ESTABLISHED
+ *
+ * The checks that have to be made before the state may change:
+ *   1. the segment must carry the ACK flag, otherwise it is stale or hostile
+ *      and must be dropped without touching the TCB,
+ *   2. its acknowledgement number must equal our ISN + 1 (SND.NXT), which is
+ *      the only proof that the peer really received our SYN/ACK. An ACK for
+ *      an unexpected sequence number must be ignored,
+ *   3. only after both checks pass may the TCB become ESTABLISHED and its fd
+ *      be handed to the application by accept(), which requires the
+ *      application thread blocked on stream->cond to be woken up,
+ *   4. a retransmitted SYN must be answered with the same SYN/ACK again,
+ *      otherwise a single lost SYN/ACK would stall the connection forever.
+ *
+ * @param[in,out] stream the TCB on which the segment was matched; its status
+ *                       is SYN_RCVD on entry
+ * @param[in]     tcphdr the parsed TCP header of the received segment
+ * @param[in]     iphdr  the parsed IPv4 header of the received segment
+ * @return 0 on success, -1 when the segment is invalid and must be dropped
+ */
+static int ustack_tcp_handle_syn_rcvd(struct ustack_tcp_stream *stream, struct rte_tcp_hdr *tcphdr, struct rte_ipv4_hdr *iphdr) {
+        
+        if (tcphdr->tcp_flags & RTE_TCP_ACK_FLAG) {
+
+            if (stream->status == USTACK_TCP_STATUS_SYN_RCVD) {
+
+                uint32_t acknum = ntohl(tcphdr->recv_ack);
+                if (acknum == stream->snd_nxt + 1) {
+                    //TODO: connect success
+                    //if acknum != snd_nxt + 1 ,we should send a errno as server
+                }
+
+                // 对于监听 sokcet 需要考虑到 dip=0 sip=0/localip dport=0 sport=监听的端口
+                struct ustack_tcp_stream *listner = ustack_tcp_stream_search(0, 0, 0, stream->sport);
+                if (listner == NULL) {
+                    rte_exit(EXIT_FAILURE, "ustack_tcp_stream_search failed\n");
+                }
+
+                stream->status = USTACK_TCP_STATUS_ESTABLISHED;
+            }
+
+
+        }
+    return 0;
+}
+
+/**
+ * @brief Handle a segment that arrives on an ESTABLISHED connection.
+ *
+ * @details
+ * ESTABLISHED is the only steady state of a TCP connection: both directions
+ * are open and every segment carries payload, an acknowledgement, or both.
+ * This is the hot path of the stack, and it is responsible for:
+ *
+ *   1. sequence number checking - a segment is acceptable only when its
+ *      sequence number falls inside the receive window, i.e. it lies in
+ *      [RCV.NXT, RCV.NXT + window). Out of order segments are either queued
+ *      for later reassembly or dropped; a segment that is already covered by
+ *      the window is acknowledged again but not delivered twice,
+ *   2. moving the payload to the application - the bytes following the TCP
+ *      header, whose length is (IP total length - IP header - data offset),
+ *      are copied into stream->rcvbuf as a tcp_fragment, and the application
+ *      thread blocked in recv() is woken up through stream->cond,
+ *   3. advancing RCV.NXT by exactly the number of accepted payload bytes, so
+ *      that the ACK we send acknowledges nothing more and nothing less,
+ *   4. sending an ACK for the newly received data (a full stack would delay
+ *      it up to 500 ms or until a second full sized segment arrives),
+ *   5. advancing SND.NXT from the peer acknowledgement number and, in a
+ *      complete implementation, driving retransmission and congestion
+ *      control from the same place,
+ *   6. reacting to FIN - after the peer has closed its send direction the TCB
+ *      moves to CLOSE_WAIT and the application is notified, which is why a
+ *      handler for this state may not ignore the FIN flag.
+ *
+ * @note The checksum has already been verified by the caller, so the payload
+ *       can be assumed intact when it reaches this function.
+ *
+ * @param[in,out] stream the TCB on which the segment was matched; its status
+ *                       is ESTABLISHED on entry
+ * @param[in]     tcphdr the parsed TCP header of the received segment
+ * @param[in]     tcplen the length of TCP packet,including the header and data payload
+ * @return 0 on success, -1 when the segment is out of window and must be
+ *         dropped
+ */
+static int ustack_tcp_handle_established(struct ustack_tcp_stream *stream, struct rte_tcp_hdr *tcphdr, int tcplen) {
+
+    //ESTABLISHE 状态下收到 SYN 包属于异常行为 
+    //利用序列号检查来防御这种异常
+    if (tcphdr->tcp_flags & RTE_TCP_SYN_FLAG) {
+
+    }
+    if (tcphdr->tcp_flags & RTE_TCP_PSH_FLAG) {
+
+    }
+    if (tcphdr->tcp_flags & RTE_TCP_ACK_FLAG) {
+
+    }
+    if (tcphdr->tcp_flags & RTE_TCP_FIN_FLAG) {
+        
+    }
+
+
+    return 0;
+}
+
+/**
+ * @brief Handle a segment that arrives on a connection in CLOSE_WAIT state.
+ *
+ * @details
+ * CLOSE_WAIT means the peer has already sent its FIN and that FIN has been
+ * acknowledged, but the local application has not called close() yet:
+ *
+ *   ESTABLISHED -- recv FIN, send ACK --> CLOSE_WAIT
+ *   CLOSE_WAIT  -- local close() sends FIN --> LAST_ACK
+ *
+ * The connection is now half closed: the peer to local direction is finished
+ * (the application reads the remaining buffered data and then sees EOF from
+ * recv()), while the local to peer direction is still usable, so the
+ * application is allowed to keep sending.
+ *
+ * A handler for this state therefore has to:
+ *   1. still acknowledge payload that was already in flight when the FIN was
+ *      sent, because a FIN only closes the peer send direction and does not
+ *      invalidate the data that preceded it,
+ *   2. ignore a repeated FIN from the peer - the peer has already closed once
+ *      and acknowledging it twice would desynchronise the sequence numbers,
+ *   3. send a FIN and move the TCB to LAST_ACK only when the application
+ *      really calls close(), never autonomously,
+ *   4. drop everything else, since a well behaved peer has nothing more to
+ *      send in this direction.
+ *
+ * @note A TCB that stays in CLOSE_WAIT forever is a classic application bug:
+ *       it means the peer closed and the local side never called close().
+ *
+ * @param[in,out] stream the TCB on which the segment was matched; its status
+ *                       is CLOSE_WAIT on entry
+ * @param[in]     tcphdr the parsed TCP header of the received segment
+ * @param[in]     iphdr  the parsed IPv4 header of the received segment
+ * @return 0 on success, -1 when the segment must be dropped
+ */
+static int ustack_tcp_handle_close_wait(struct ustack_tcp_stream *stream, struct rte_tcp_hdr *tcphdr, struct rte_ipv4_hdr *iphdr) {
+
+    return 0;
+}
+
+/**
+ * @brief Handle a segment that arrives on a connection in LAST_ACK state.
+ *
+ * @details
+ * LAST_ACK is the last state of the local close sequence, entered after the
+ * application called close() on a half closed connection:
+ *
+ *   CLOSE_WAIT -- local close() sends FIN --> LAST_ACK
+ *   LAST_ACK   -- recv ACK covering our FIN --> CLOSED
+ *
+ * Very little may happen here, and that is the point:
+ *   1. an ACK whose acknowledgement number covers our FIN (SND.NXT) proves
+ *      that the peer has seen the FIN, so the TCB may be destroyed and the fd
+ *      released back to the bitmap,
+ *   2. any payload or FIN received now comes from a peer that has not seen
+ *      our FIN yet, so our FIN has to be retransmitted instead of being
+ *      silently ignored, otherwise the peer keeps the connection open until
+ *      its own timer expires,
+ *   3. the TCB must not be freed on anything except a valid ACK, otherwise a
+ *      duplicated or delayed segment would destroy a live connection.
+ *
+ * @note Everything still referenced by the TCB must be released together with
+ *       it - both rte_ring queues, every fragment still queued inside them,
+ *       and the condition variable / mutex pair - otherwise the rings leak.
+ *
+ * @param[in,out] stream the TCB on which the segment was matched; its status
+ *                       is LAST_ACK on entry, and it may be freed by this
+ *                       function once the final ACK is seen
+ * @param[in]     tcphdr the parsed TCP header of the received segment
+ * @param[in]     iphdr  the parsed IPv4 header of the received segment
+ * @return 0 on success, -1 when the segment must be dropped
+ */
+static int ustack_tcp_handle_last_ack(struct ustack_tcp_stream *stream, struct rte_tcp_hdr *tcphdr, struct rte_ipv4_hdr *iphdr) {
+    
+    return 0;
+}
+
+
+static int ustack_tcp_process (struct rte_mbuf *tcp_mbuf) {// process received mbuf
+    
+	struct rte_ipv4_hdr *iphdr =  rte_pktmbuf_mtod_offset(tcp_mbuf, struct rte_ipv4_hdr *, 
+				sizeof(struct rte_ether_hdr));
+    
+    // 要根据头部的字段来动态计算下一个报文头部位置。
+    uint8_t ip_hdr_len = (iphdr->version_ihl & 0x0f) * 4;
+    struct rte_tcp_hdr *tcphdr = (struct rte_tcp_hdr*)((uint8_t*)iphdr + ip_hdr_len);
+    
+    uint16_t tcpcksum = tcphdr->cksum;
+    tcphdr->cksum = 0;
+    uint16_t cksum = rte_ipv4_udptcp_cksum(iphdr, tcphdr);
+
+    if (cksum != tcpcksum) {
+        printf("cksum: %x, tcp cksum: %x\n", cksum, tcpcksum);
+        return -1;
+    }
+
+    struct ustack_tcp_stream *stream = ustack_tcp_stream_search(iphdr->dst_addr, iphdr->src_addr, 
+            tcphdr->dst_port, tcphdr->src_port);
+
+    if (stream == NULL) {
+        return -2;
+    }
+
+    switch (stream->status)
+    {
+    case USTACK_TCP_STATUS_CLOSED: // client
+        break;
+
+    case USTACK_TCP_STATUS_LISTEN: //server
+        break;
+	case USTACK_TCP_STATUS_SYN_RCVD:// server
+        break;
+	case USTACK_TCP_STATUS_SYN_SENT:// client
+	case USTACK_TCP_STATUS_ESTABLISHED:// server | client 
+	case USTACK_TCP_STATUS_FIN_WAIT_1://~client
+	case USTACK_TCP_STATUS_FIN_WAIT_2://~client
+	case USTACK_TCP_STATUS_CLOSING:// ~client
+	case USTACK_TCP_STATUS_TIMEWAIT://~client
+	case USTACK_TCP_STATUS_CLOSE_WAIT://~server
+	case USTACK_TCP_STATUS_LAST_ACK://~server
+
+    default:
+        break;
+    }
+}
+
+int tcp_out (struct rte_mempool* mbuf_pool) {
+
+    struct ustack_tcp_table *table = tcpInstance();
+    struct ustack_tcp_stream *iter;
+
+    for (iter = table->tcb_set; iter != NULL; iter = iter->next) {
+        
+        struct tcp_fragment *fragment = NULL;
+        if (rte_ring_mc_dequeue(iter->sndbuf, (void**)&fragment) < 0) continue;
+
+        uint8_t *dstmac = ng_get_dst_macaddr(iter->dip);// 查目的 IP 对应的 MAC 地址指针
+
+        if (dstmac == NULL) {
+            // 分支一：ARP 未命中。目的 IP 对应的 MAC 还不知道，这个描述符不能组包发出。
+            // 第一步先广播一个 ARP Request 去问下一跳的 MAC，
+            // gDefaultArpMac (ff:ff:ff:ff:ff:ff) 就是直接丢给广播地址的请求帧。
+            struct rte_mbuf *arpbuf = ustack_send_arp(mbuf_pool, RTE_ARP_OP_REQUEST, gDefaultArpMac, 
+                iter->sip, iter->dip);
+
+            struct inout_ring *ring = ringInstance();
+            if (rte_ring_mp_enqueue_burst(ring->out, (void **)&arpbuf, 1, NULL) != 1) {
+                rte_pktmbuf_free(arpbuf);
+            }
+
+            // 第二步，描述符不能丢，原样塞回 sndbuf：等对端回 ARP Reply、ARP 表被更新之后，
+            // 下一轮 tcp_out() 再把它取出来，那时就能命中 MAC 了。
+            // 这里不做忙等重试，避免同一轮里反复空转。
+            rte_ring_mp_enqueue(iter->sndbuf, fragment);
+        
+        } else {
+            // 分支二：ARP 命中，目的 MAC 已知，可以真正组包并发出去了。
+
+            // 把描述符序列化成完整的以太网帧：以太头 + IPv4 头 + TCP 固定头
+            // + TCP 选项 + payload，并依次算好 IP 校验和与 TCP 校验和。
+            struct rte_mbuf* tcpbuf = ustack_tcp_pkt(mbuf_pool, iter->sip, iter->dip, 
+                iter->localmac, dstmac, fragment);
+
+            struct inout_ring *ring = ringInstance();
+
+            // 组好包后投递到 ring->out，由 IO 核的主循环用 rte_eth_tx_burst 真正打出去：
+            // 协议核只负责“造包”，不直接碰网卡。
+            // 入队失败说明 out ring 已满，此时 mbuf 还在本核手里，必须自己 free，
+            // 否则每丢一个包就泄漏一个 mbuf（最终会把 mempool 耗尽）。
+            if (tcpbuf != NULL &&
+                rte_ring_mp_enqueue_burst(ring->out, (void **)&tcpbuf, 1, NULL) != 1) {
+                    rte_pktmbuf_free(tcpbuf);
+            }
+            // 描述符已完成使命：先释放它额外持有的 payload 缓冲区，再释放描述符本身。
+            // data 可能是 NULL（SYN/ACK、纯 ACK 这类控制报文不带 payload），所以要先判断再释放。
+            if (fragment->data != NULL) {
+                    rte_free(fragment->data);
+            }
+
+                rte_free(fragment);
+        }
+    }
+    return 0;
+}
+
+static int tcp_server_entry(__rte_unused void* arg) {
+
 }
 
 int main(int argc, char *argv[]) {
