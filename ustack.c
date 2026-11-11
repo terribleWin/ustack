@@ -37,9 +37,11 @@
 #include <rte_ethdev.h>
 #include <rte_ip.h>
 #include <rte_timer.h>
+#include <rte_kni.h>
 
 #include <arpa/inet.h>
-
+#include <unistd.h>
+#include <sys/syscall.h>
 
 #include "arp.h"
 #include "fd.h"
@@ -58,6 +60,7 @@ static int ustack_tcp_process(struct rte_mbuf *mbufpool);
 int gDpdkPortId = 0;
 
 int global_portid = 0;   /* 使用的端口号（对应第一个可用的 ethdev） */
+static int ustack_eal_ready = 0;
 
 #define NUM_MBUFS (4096 - 1)   /* mbuf 内存池容量，决定可同时在途的收包缓冲区数量 */
 #define BURST_SIZE 128   /* 单次收包批量上限（rte_eth_rx_burst 一次最多收取的报文数） */
@@ -96,6 +99,8 @@ static uint8_t gDefaultArpMac[RTE_ETHER_ADDR_LEN] = {0xff, 0xff, 0xff, 0xff, 0xf
 
 #define MAKE_IPV4_ADDR(a, b, c, d) (a + (b<<8) + (c<<16) + (d<<24))
 
+struct rte_kni *global_kni = NULL;
+
 static uint32_t gLocalIp = MAKE_IPV4_ADDR(192, 168, 139, 137); // 192168139137
 
 //TODO:对于全局唯一的源 MAC、IP 地址需要引入 DPDK 动态查询网卡 MAC、IP 地址
@@ -105,7 +110,7 @@ uint8_t global_dmac[RTE_ETHER_ADDR_LEN];
 
 // TODO:采用静态全局变量来注册本机网卡 IP信息，后续可以引入动态计算
 static uint32_t global_sip;
-static uint32_t global_dip;
+static uint32_t global_dip __rte_unused;
 
 uint16_t global_sport;
 uint16_t global_dport;
@@ -131,6 +136,7 @@ static struct inout_ring *ringInstance(void) {
 
     if (rInst == NULL) {
         rInst = rte_malloc("in/out ring", sizeof(struct inout_ring), 0);
+        if (rInst == NULL) return NULL;
         memset(rInst , 0, sizeof(struct inout_ring));
     }
 
@@ -281,6 +287,7 @@ static struct ustack_tcp_table *tcpInstance(void) {
 
     if (tInst == NULL) {
         tInst = rte_malloc("ustack_tcp_table", sizeof(struct ustack_tcp_table), 0);
+        if (tInst == NULL) return NULL;
         memset(tInst, 0, sizeof(struct ustack_tcp_table));
     }
     
@@ -301,13 +308,18 @@ static const struct rte_eth_conf port_conf_default = {
 /* 初始化 */
 static int ustack_init_port(struct rte_mempool *mbuf_pool) {
     // 统计当前可用的以太网端口数（仅打印信息，本程序只使用 global_portid）
+    
+    printf("[i1] count_avail\n"); fflush(stdout);
     uint16_t nb_sys_ports = rte_eth_dev_count_avail();
+    printf("[i2] ports=%u\n", nb_sys_ports); fflush(stdout);
+
     if (nb_sys_ports == 0) {
         rte_exit(EXIT_FAILURE, "No supported eth found\n");
     }
 
     struct rte_eth_dev_info dev_info;
     rte_eth_dev_info_get(global_portid, &dev_info);
+    printf("[i3] driver=%s\n", dev_info.driver_name); fflush(stdout);
 
     printf("NIC Name: %s\n", dev_info.driver_name);
     printf("TX Desc Min: %u, Max: %u, Align: %u\n", 
@@ -323,8 +335,10 @@ static int ustack_init_port(struct rte_mempool *mbuf_pool) {
 #else
     const int num_tx_queues = 0;
 #endif
-
+    
+    printf("[i4] configure...\n"); fflush(stdout);
     int ret = rte_eth_dev_configure(global_portid, num_rx_queues, num_tx_queues, &port_conf_default);
+    printf("[i5] configure ret=%d\n", ret); fflush(stdout);
     if (ret < 0) {
         rte_exit(EXIT_FAILURE, "Could not configure port %d (ret=%d)\n", global_portid, ret);
     }
@@ -425,7 +439,7 @@ static int ustack_encode_udp_pkt (uint8_t *msg, uint32_t sip, uint32_t dip,
 
 // Get a mbuf from the memory pool, and fill the UDP fields.return the mbuf.
 static struct rte_mbuf *ustack_udp_pkt (struct rte_mempool *mbuf_pool, uint32_t sip, uint32_t dip, uint16_t sport, uint16_t dport, 
-            const uint8_t *srcmac, uint8_t *dstmac, uint8_t *data, uint16_t length) {
+        uint8_t *srcmac, uint8_t *dstmac, uint8_t *data, uint16_t length) {
 
     const uint16_t total_len = sizeof(struct rte_ether_hdr) + sizeof(struct rte_ipv4_hdr) + 
                                 sizeof(struct rte_udp_hdr) + length;
@@ -756,7 +770,7 @@ static void arp_request_timer_cb(__attribute__((unused)) struct rte_timer *tim,
         
         struct rte_mempool *mbuf_pool = (struct rte_mempool*) arg;
         struct inout_ring *ring =  ringInstance();
-
+#if 0
         int i = 0;
         for (i = 1; i <= 254 ; i++) {
         
@@ -775,14 +789,24 @@ static void arp_request_timer_cb(__attribute__((unused)) struct rte_timer *tim,
             arp_mbuf = ustack_send_arp(mbuf_pool, RTE_ARP_OP_REQUEST, dstmac, gLocalIp, dstip);
 
         }
-        
+  
         //if (rte_eth_tx_burst(gDpdkPortId, 0, &arp_mbuf, 1)!=1) 
         //    rte_pktmbuf_free(arp_mbuf);
         
        rte_ring_mp_enqueue_burst(ring->out ,(void**)&arp_mbuf, 1, NULL);
 
     }
-
+#endif
+        struct arp_table *table = arp_table_instance();
+        struct arp_entry *iter;
+        for (iter = table->entries; iter != NULL; iter = iter->next) {
+            /* 只对已知条目做单播老化探测，不再盲发广播 */
+            if (iter->hwaddr == NULL) continue;
+            struct rte_mbuf *arp_mbuf = ustack_send_arp(mbuf_pool, RTE_ARP_OP_REQUEST,
+                                            iter->hwaddr, gLocalIp, iter->ip);
+            if (arp_mbuf && rte_ring_mp_enqueue_burst(ring->out, (void**)&arp_mbuf, 1, NULL) != 1)
+                rte_pktmbuf_free(arp_mbuf);
+        }
 }
 
 /** ustack_tcp_stream的protocol字段偏移 16，ustack_udp_sock偏移 20
@@ -970,6 +994,17 @@ int udp_out(struct rte_mempool *mbuf_pool) {
     return 0;
 }
 
+/*rte_kni_tx_burst() 要求 mbuf 的 data 指向完整以太帧的起始*/
+static inline void ustack_kni_inject(struct rte_mbuf *mbuf) {
+    if (global_kni == NULL) {
+        rte_pktmbuf_free(mbuf);
+        return ;
+    }
+    if (rte_kni_tx_burst(global_kni, &mbuf, 1) != 1) {
+        rte_pktmbuf_free(mbuf);
+    }
+}
+
 // Multi thread
 static int pkt_process(__attribute__((unused)) void *arg) {
     
@@ -1065,7 +1100,8 @@ static int pkt_process(__attribute__((unused)) void *arg) {
 
             // 处理 IPv4 报文
             if (ethhdr->ether_type != rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4)) {
-                rte_pktmbuf_free(mbufs[i]);
+                //rte_pktmbuf_free(mbufs[i]);
+                ustack_kni_inject(mbufs[i]);
                 continue;
             }
 
@@ -1116,9 +1152,14 @@ static int pkt_process(__attribute__((unused)) void *arg) {
                 // 处理 TCP 报文
             } else if (iphdr->next_proto_id == IPPROTO_TCP) {
 
-                printf("ustack_tcp_process\n");
+                //printf("ustack_tcp_process\n");
                 ustack_tcp_process(mbufs[i]);
             
+            } else {
+
+                printf("other protcols, process through kni\n");
+                ustack_kni_inject(mbufs[i]);
+
             }
         }
         // 应用层调用 sendto 时将数据塞进 sndbuf 里面的数据发送
@@ -1223,6 +1264,12 @@ static struct ustack_tcp_stream* get_accept_tcb(uint16_t port) {
  *               the fd is not found.
  */
 void* get_hostinfo_fromfd(int sockfd) {
+    // If the dpdk EAL do not initialized, it should not find the UDP/TCP block.
+    if (!ustack_eal_ready) return NULL; 
+
+    if (sockfd < 0 || sockfd >= MAX_FD_COUNT) return NULL;
+    if ((fd_table[sockfd / 8] & (0x1 << (sockfd % 8))) == 0) return NULL;
+
     struct ustack_udp_sock *host;
     
     for (host = lhost; host != NULL; host = host->next) {
@@ -1231,14 +1278,14 @@ void* get_hostinfo_fromfd(int sockfd) {
         }
     }
 
+    if (tInst != NULL) {
     struct ustack_tcp_stream *stream;
-    struct ustack_tcp_table *table = tcpInstance();
-    for (stream = table->tcb_set; stream != NULL;stream = stream->next) {
-        if (sockfd == stream->fd) {
-            return stream;
+        for (stream = tInst->tcb_set; stream != NULL;stream = stream->next) {
+            if (sockfd == stream->fd) {
+                return stream;
+            }
         }
     }
-
     return NULL;
 }
 
@@ -1265,6 +1312,11 @@ struct ustack_udp_sock * get_hostinfo_fromip_port(uint32_t dip, uint16_t port, u
 // 重点是需要利用 fd 来区分何时调用系统 API， 何时采用本协议栈为应用层提供的 API
 // Poxis API
 int socket(__rte_unused int domain, int type,__rte_unused int protocol) {
+    
+    // If meeting the DPDK `s own socket, forward it to kernel.
+    if (!ustack_eal_ready){
+        return (int)syscall(SYS_socket, domain, type, protocol);
+    }
     
     int fd = get_fd_frombitmap();
 
@@ -1358,7 +1410,7 @@ int socket(__rte_unused int domain, int type,__rte_unused int protocol) {
 int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
     
     void *hostinfo = get_hostinfo_fromfd(sockfd);
-    if (hostinfo == NULL) return -1;
+    if (hostinfo == NULL)  return (int)syscall(SYS_bind, sockfd, addr, addrlen);
 
     // Find the UDP control block
     struct ustack_udp_sock *host = (struct ustack_udp_sock*)hostinfo;
@@ -1367,7 +1419,7 @@ int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
 
     if (host->protocol == IPPROTO_UDP) {
         // Notice that sockaddr_in is designed for IPv4 
-        struct sockaddr_in *localaddr = (const struct sockaddr_in*)addr;
+        const struct sockaddr_in *localaddr = (const struct sockaddr_in*)addr;
         if (localaddr->sin_family != AF_INET) return -1;
 
         host->localport = localaddr->sin_port;
@@ -1400,7 +1452,9 @@ int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
 int listen(int sockfd,__rte_unused int backlog) {
 
     void* hostinfo = get_hostinfo_fromfd(sockfd);
-    if (hostinfo == NULL) return -1;
+    if (hostinfo == NULL) {
+        return (int)syscall(SYS_listen, sockfd, backlog);
+    }
     
     struct ustack_tcp_stream *stream = (struct ustack_tcp_stream*)hostinfo;
     if (stream->protocol == IPPROTO_TCP) {
@@ -1413,7 +1467,9 @@ int listen(int sockfd,__rte_unused int backlog) {
 int accept(int sockfd, struct sockaddr *addr, __rte_unused socklen_t *addrlen) {
     
     void *hostinfo = get_hostinfo_fromfd(sockfd);
-    if (hostinfo == NULL) return -1;
+    if (hostinfo == NULL) {
+        return (int)syscall(SYS_accept, sockfd, addr, addrlen);
+    }
 
     struct ustack_tcp_stream *stream = (struct ustack_tcp_stream*)hostinfo;
     if (stream->protocol == IPPROTO_TCP) {
@@ -1438,8 +1494,10 @@ int accept(int sockfd, struct sockaddr *addr, __rte_unused socklen_t *addrlen) {
     return -1;
 }
 
-int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen) {
+int connect(__rte_unused int sockfd, __rte_unused const struct sockaddr *addr,
+            __rte_unused socklen_t addrlen) {
 
+    return -1;          /* TODO: active open still wait to be implemented */
 }
 
 ssize_t send(int sockfd, const void *buf, size_t len,__rte_unused int flags) {
@@ -1447,7 +1505,9 @@ ssize_t send(int sockfd, const void *buf, size_t len,__rte_unused int flags) {
     ssize_t length = 0;
 
     void *hostinfo = get_hostinfo_fromfd(sockfd);
-    if (hostinfo == NULL) return -1;
+    if (hostinfo == NULL) {
+        return (ssize_t)syscall(SYS_sendto, sockfd, buf, len, flags, NULL, NULL); 
+    }
     
     struct ustack_tcp_stream *stream = (struct ustack_tcp_stream*)hostinfo;
     if (stream->protocol == IPPROTO_TCP) {
@@ -1520,11 +1580,13 @@ ssize_t send(int sockfd, const void *buf, size_t len,__rte_unused int flags) {
  * and carries the same reference to the 4.4BSD tcp_input().
  */
 
-ssize_t sendto(int sockfd, const void *buf, size_t len, int flags,
+ssize_t sendto(int sockfd, const void *buf, size_t len,__rte_unused int flags,
                       const struct sockaddr *dest_addr, socklen_t addrlen) {
 
     struct ustack_udp_sock *host = get_hostinfo_fromfd(sockfd);
-    if (host == NULL) return -1;
+    if (host == NULL) {
+        return (ssize_t)syscall(SYS_sendto, sockfd, buf, len, flags, dest_addr, addrlen);  
+    }
 
     const struct sockaddr_in *daddr = (const struct sockaddr_in *)dest_addr;
     struct ustack_offload *ol = rte_malloc("offload", sizeof(struct ustack_offload), 0);
@@ -1558,11 +1620,13 @@ ssize_t sendto(int sockfd, const void *buf, size_t len, int flags,
 
 } 
 
-ssize_t recv(int sockfd, void *buf, size_t len, int flags) {
+ssize_t recv(int sockfd, void *buf, size_t len,__rte_unused int flags) {
     ssize_t length = 0;
 
     void* hostinfo = get_hostinfo_fromfd(sockfd);
-    if (hostinfo == NULL) return -1;
+    if (hostinfo == NULL) {
+         return (ssize_t)syscall(SYS_recvfrom, sockfd, buf, len, flags, NULL, NULL);
+    }
 
     struct ustack_tcp_stream *stream = (struct ustack_tcp_stream*)hostinfo;
     if (stream->protocol == IPPROTO_TCP) {
@@ -1577,7 +1641,7 @@ ssize_t recv(int sockfd, void *buf, size_t len, int flags) {
         pthread_mutex_unlock(&stream->mutex);
         printf("rte_ring_mc_dequeue afrter\n");
 
-        if (fragment->length > len) {
+        if ((size_t)fragment->length > len) {
             rte_memcpy(buf, fragment->data, len);
 
             uint32_t i = 0;
@@ -1610,10 +1674,11 @@ ssize_t recv(int sockfd, void *buf, size_t len, int flags) {
 ssize_t recvfrom(int sockfd, void *buf, size_t len, __rte_unused int flags,
                         struct sockaddr *src_addr, __rte_unused socklen_t *addrlen) {
         struct ustack_udp_sock* host = get_hostinfo_fromfd(sockfd);
-        if (host == NULL) return -1;
+        if (host == NULL) {
+            return (ssize_t)syscall(SYS_recvfrom, sockfd, buf, len, flags, src_addr, addrlen);
+        }
          
         struct ustack_offload *ol = NULL;
-        unsigned char *ptr = NULL;
 
         int nb = -1;
 
@@ -1672,7 +1737,9 @@ ssize_t recvfrom(int sockfd, void *buf, size_t len, __rte_unused int flags,
  */
 int close(int fd) {
     void *hostinfo = get_hostinfo_fromfd(fd);
-    if (hostinfo == NULL) return -1;
+    if (hostinfo == NULL) {
+        return (int)syscall(SYS_close, fd);
+    }
 
     struct  ustack_udp_sock *host = (struct ustack_udp_sock*)hostinfo;
     // TODO: 解决与 Linux 系统的 glibc 产生的符号劫持问题
@@ -1851,8 +1918,8 @@ static struct ustack_tcp_stream *ustack_tcp_stream_create(uint32_t sip, uint32_t
 
     printf("ustack_tcp_stream_create\n");
 
-    stream->sndbuf = rte_ring_create("sndbuf", RING_SIZE, rte_socket_id, 0);
-    stream->rcvbuf = rte_ring_create("rcvbuf", RING_SIZE, rte_socket_id, 0);
+    stream->sndbuf = rte_ring_create("sndbuf", RING_SIZE, rte_socket_id(), 0);
+    stream->rcvbuf = rte_ring_create("rcvbuf", RING_SIZE, rte_socket_id(), 0);
 
     // TODO [FIXME]: 生产环境需替换为更安全的 ISN 生成算法，防止 TCP 伪造攻击。
     // uint64_t now_us = rte_get_timer_cycles() / (rte_get_timer_hz()/ 1000000ULL);
@@ -2235,7 +2302,7 @@ static int ustack_tcp_handle_close_wait(struct ustack_tcp_stream *stream, struct
  * @param[in]     iphdr  the parsed IPv4 header of the received segment
  * @return 0 on success, -1 when the segment must be dropped
  */
-static int ustack_tcp_handle_last_ack(struct ustack_tcp_stream *stream, struct rte_tcp_hdr *tcphdr, struct rte_ipv4_hdr *iphdr) {
+static int ustack_tcp_handle_last_ack(struct ustack_tcp_stream *stream, struct rte_tcp_hdr *tcphdr,__rte_unused struct rte_ipv4_hdr *iphdr) {
     
     if (tcphdr->tcp_flags & RTE_TCP_ACK_FLAG) {
         
@@ -2274,6 +2341,7 @@ static int ustack_tcp_process (struct rte_mbuf *tcp_mbuf) {// process received m
 
     if (cksum != tcpcksum) {
         printf("cksum: %x, tcp cksum: %x\n", cksum, tcpcksum);
+        rte_pktmbuf_free(tcp_mbuf);
         return -1;
     }
 
@@ -2281,6 +2349,7 @@ static int ustack_tcp_process (struct rte_mbuf *tcp_mbuf) {// process received m
             tcphdr->dst_port, tcphdr->src_port);
 
     if (stream == NULL) {
+        rte_pktmbuf_free(tcp_mbuf);
         return -2;
     }
 
@@ -2372,6 +2441,8 @@ static int ustack_tcp_process (struct rte_mbuf *tcp_mbuf) {// process received m
     default:
         break;
     }
+    rte_pktmbuf_free(tcp_mbuf);
+    return 0;
 }
 
 int tcp_out (struct rte_mempool* mbuf_pool) {
@@ -2476,6 +2547,58 @@ static int tcp_server_entry(__rte_unused void* arg) {
     }
 
 }
+#define MAX_PACKET_SIZE 2048
+
+static int ustack_config_network_if(uint16_t port_id, uint8_t if_up) {
+
+    if (!rte_eth_dev_is_valid_port(port_id)) {
+        return -EINVAL;
+    }
+
+
+    #if 0
+    int ret = 0;
+    if (if_up) {
+
+        rte_eth_dev_stop(port_id);
+        ret = rte_eth_dev_start(port_id);
+    } else {
+        rte_eth_dev_stop(port_id);
+    }
+
+    if (ret < 0) {
+        printf("Failed to start port :%d\n", port_id);
+    }
+    #endif
+    return 0;
+}
+
+/** Callback function */
+static struct rte_kni *ustack_alloc_kni(uint16_t port_id,struct rte_mempool *mbuf_pool) {
+
+    struct rte_kni_conf conf; 
+    struct rte_kni_ops ops;
+    memset(&conf, 0, sizeof(conf));
+    memset(&ops, 0, sizeof(ops));
+    
+    snprintf(conf.name, RTE_KNI_NAMESIZE, "ustack%u", global_portid);
+    conf.group_id = port_id;
+    conf.mbuf_size = MAX_PACKET_SIZE;
+    conf.force_bind = 1;                 /* 固定绑到 DPDK 主 lcore，便于 handle_request */
+    conf.core_id = rte_lcore_id();
+    rte_eth_macaddr_get(port_id, (struct rte_ether_addr*)conf.mac_addr);
+    rte_eth_dev_get_mtu(port_id, &conf.mtu);
+
+    ops.port_id = global_portid;
+    ops.config_network_if = ustack_config_network_if;
+
+    struct rte_kni *kni = rte_kni_alloc(mbuf_pool, &conf, &ops);
+    if (!kni) {
+        rte_exit(EXIT_FAILURE, "failed to create for port :%d\n", port_id);
+    }
+
+    return kni;
+}
 
 int main(int argc, char *argv[]) {
 
@@ -2490,7 +2613,15 @@ int main(int argc, char *argv[]) {
         rte_exit(EXIT_FAILURE, "Could not create mbuf pool\n");
     }
 
+    ustack_eal_ready = 1;
+
+    // KNI subbsystem must be initialized after EAL initialization and 
+    //before any KNI interface is attempted to be allocated
+    if (rte_kni_init(global_portid) == -1) {
+        rte_exit(EXIT_FAILURE, "kni init failed\n");
+    }
     ustack_init_port(mbuf_pool);
+    global_kni = ustack_alloc_kni(global_portid, mbuf_pool);
 
     rte_eth_promiscuous_enable(global_portid); // 开启混杂模式，接收所有报文
 
@@ -2503,7 +2634,7 @@ int main(int argc, char *argv[]) {
     unsigned lcore_id = rte_lcore_id();
 
     // 在哪个核上，多久执行一次，执行对应的回调函数
-    rte_timer_reset(&arp_timer, hz, PERIODICAL, lcore_id, arp_request_timer_cb, mbuf_pool); 
+    rte_timer_reset(&arp_timer,30 * hz, PERIODICAL, lcore_id, arp_request_timer_cb, mbuf_pool); 
 
     // Initialize the inout ring buffer used to send and receive data
     struct inout_ring *ring = ringInstance();
@@ -2557,6 +2688,19 @@ int main(int argc, char *argv[]) {
             uint16_t nb_tx = rte_eth_tx_burst(global_portid, 0, tx, nb_deq);
             for (unsigned k = nb_tx;k < nb_deq;k++) {
                 rte_pktmbuf_free(tx[k]);
+            }
+        }
+
+        if (global_kni != NULL) {
+            rte_kni_handle_request(global_kni);
+
+            struct rte_mbuf *kni_tx[BUFFER_SIZE];
+            uint16_t nb_kni_tx = rte_kni_rx_burst(global_kni, kni_tx, BUFFER_SIZE);
+            if (nb_kni_tx > 0) {
+                uint16_t sent = rte_eth_tx_burst(global_portid, 0, kni_tx, nb_kni_tx);
+                for (uint16_t k = sent; k < nb_kni_tx; k++) {
+                    rte_pktmbuf_free(kni_tx[k]);
+                }
             }
         }
 

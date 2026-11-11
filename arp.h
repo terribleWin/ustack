@@ -144,12 +144,13 @@ static struct arp_entry *ng_arp_entry_lookup(uint32_t ip) {
 
 /// @brief 查找 arp 表中是否存在指定 IP 的条目
 /// @param ip 要查找的 IP 地址（网络字节序）
-/// @return 如果存在，返回 arp_entry 指针；否则返回 NULL
+/// @return 如果存在，返回 mac 地址指针；否则返回 NULL
 static uint8_t* ng_get_dst_macaddr(uint32_t dip) {
 
 	struct arp_entry *iter;
 	struct arp_table *table = arp_table_instance();
 
+	// TODO[FIXME]: 采用ng_arp_entry_lookup实现
 	// iter = ng_arp_entry_lookup(dip);
 	// return iter->hwaddr;
 	for (iter = table->entries;iter != NULL;iter = iter->next) {
